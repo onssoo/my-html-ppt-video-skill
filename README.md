@@ -1,5 +1,7 @@
 # html-ppt-video-skill
 
+**[English](README_EN.md)** | 中文
+
 将文档转为带中文配音和字幕的 HTML 演示视频。配合 [html-ppt-skill](https://github.com/lewislulu/html-ppt-skill) 使用。
 
 ## 功能
