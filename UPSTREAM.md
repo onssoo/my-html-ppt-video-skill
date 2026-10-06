@@ -4,7 +4,7 @@
 
 - **上游原版**保留在 `upstream/`（`SKILL.md` 212 行 + `build_video.py` 476 行 + README）—— **供对照，不参与运行**
 - **工作版**：根目录的 `SKILL.md`（改写版说明书）+ `ppt2video.py`（替代上游 `build_video.py`）
-- **上游 LICENSE**：见 `upstream/LICENSE`（如上游未附许可证，改造部分版权归 dailei）
+- **上游 LICENSE**：`LICENSE`（本仓库根目录，原样保留，**不得删除**）
 
 ## 为什么另开库
 
