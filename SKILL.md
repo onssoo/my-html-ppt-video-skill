@@ -3,210 +3,191 @@ name: html-ppt-video
 description: Use when converting a document or article into a narrated HTML presentation video with synchronized Chinese TTS audio and subtitles. Triggers when user mentions "PPT转视频", "文档转视频", "生成讲解视频", "配音幻灯片", "把PPT做成带配音的视频", "文档做成视频", or wants to turn any written content into a narrated slide video with voiceover. Also use when user has an existing HTML PPT and wants to add narration and export as video.
 ---
 
-# HTML PPT Video
+# HTML PPT Video（本地化版 · M2）
 
-将文档转为带中文配音和字幕的讲解视频。
+把文档 → HTML PPT → 带中文配音和字幕的讲解视频。
 
-## Dependencies
+> **本文件是 `juguang/html-ppt-video-skill` 的本地化改造版。**
+> 上游用 edge-tts + Google Chrome + render.sh + brew ffmpeg；本机（M2）都没有或不适用，
+> 已按实测结果替换。**改动清单和实测依据见文末「与上游的差异」。**
 
-| 依赖 | 用途 | 安装 |
+## Dependencies（M2 实测已就位）
+
+| 依赖 | 本机实际情况 | 检查方式 |
 |------|------|------|
-| edge-tts | TTS 语音合成 | `pip install edge-tts` |
-| ffmpeg + ffprobe | 视频处理 | `brew install ffmpeg` |
-| Google Chrome | headless 渲染幻灯片 PNG | 已安装即可 |
-| Noto Sans SC 字体 | 中文字幕渲染 | `brew install font-noto-sans-sc`（或系统安装） |
-| html-ppt skill | Phase 1 制作 HTML PPT | `npx skills add https://github.com/lewislulu/html-ppt-skill -y -g` |
-| render.sh | html-ppt 附带的渲染脚本 | 随 html-ppt skill 自动安装 |
-
-运行 `python build_video.py` 时会自动检查以上依赖，缺失会报错并给出安装命令。
+| **mlx-audio + Qwen3-TTS** | `~/.venv-mlx-audio`；模型 `Qwen3-TTS-12Hz-1.7B-Base-8bit`（克隆） | `ppt2video.py check` |
+| **ffmpeg** | ⚠️ **系统没有**；用 `imageio-ffmpeg` 自带的静态二进制 7.1，**自带 libass**（能烧字幕） | `resolve_ffmpeg()` 自动找 |
+| **浏览器** | ⚠️ **没有 Chrome**；用 **Microsoft Edge**（Chromium 内核，`--headless=new --screenshot` 参数通用） | `resolve_browser()` 自动找 4 个路径 |
+| **中文字幕字体** | 用 macOS 自带 **PingFang SC**（不需要 Noto Sans SC） | 烧字幕时 `force_style` 指定 |
+| **html-ppt skill** | Phase 1 做 PPT 用；本机 `~/html-ppt-skill`（`lewislulu/html-ppt-skill`） | — |
+| ~~edge-tts~~ | 备用通道，未装（要装：`uv pip install edge-tts`） | — |
+| ~~render.sh~~ | **不再使用** —— 直接调浏览器截图 | — |
 
 ## Workflow
 
 ### Phase 1: 文档 → HTML PPT
 
-**调用 html-ppt skill**，按以下步骤将文档转为 HTML 演示文稿：
+调用 **html-ppt skill** 制作。要点：
 
-**1. 分析文档，规划幻灯片结构**
+1. **规划结构**：封面 → 路线图 → 内容页（每页一个核心观点）→ 要点回顾 → 结尾
+   - 目标 **10-16 页**（对应 3-5 分钟视频）
+2. **选模板**：`~/html-ppt-skill/templates/full-decks/` 下有 15 套完整模板
+   - 技术分享 → `tech-sharing`；商务汇报 → `corporate-clean`（主题）
+   - 知识架构 → `knowledge-arch-blueprint`；课程 → `course-module`
+3. **新建 deck**：`~/html-ppt-skill/scripts/new-deck.sh my-talk`
+4. **页数不用手工确认** —— 脚本自动识别 `<section class="slide">` 的数量
 
-阅读文档，提取核心内容，规划每页幻灯片。典型结构：
+**⚠️ 结构要求**（已用真实模板验证）：
+```html
+<section class="slide" data-title="Objectives">      ← 类名必须是 slide
+<section class="slide full" data-title="Cover">      ← full 等附加类无妨
+```
+运行时按 **`#/N`（1-based）** 深链翻页 —— 与脚本默认 `--hash-start 1` 一致。
 
-| 页码 | 类型 | 内容 |
-|------|------|------|
-| 1 | 封面 | 标题 + 副标题 + 作者/日期 |
-| 2 | 路线图 | 议程/大纲概览 |
-| 3-N-2 | 内容页 | 按文档逻辑分段，每页一个核心观点 |
-| N-1 | 要点回顾 | 关键 takeaways |
-| N | 结尾 | Q&A / 感谢页 |
+### Phase 1.5: PPT 视觉确认（不可跳过）
 
-目标页数 10-16 页（对应 3-5 分钟视频）。
-
-**2. 选择主题和模板**
-
-根据内容类型选择（调用 html-ppt skill 后按 T 可实时预览切换）：
-- 技术分享 / 工程内容 → `tech-sharing` 全 deck 模板 + `tokyo-night` / `dracula` 主题
-- 商务汇报 → `corporate-clean` 主题
-- 产品发布 → `pitch-deck-vc` 主题
-- 学术报告 → `academic-paper` 主题
-- 知识架构 → `knowledge-arch-blueprint` 模板
-
-**3. 制作 PPT**
-
-使用 html-ppt skill 的全 deck 模板作为起点：
 ```bash
-~/.claude/skills/html-ppt/scripts/new-deck.sh my-talk
+open <deck-path>/index.html
 ```
+让用户确认风格、主题（按 `T` 实时切换）、排版、页数。**确认后再进 Phase 2** ——
+避免在不满意的 PPT 上白跑配音。
 
-**4. 确认页数**
+### Phase 2: 截图 + 生成确认文档
 
-最终确认幻灯片总页数 N（HTML 中 `<section class="slide">` 的数量）。
-
-### Phase 1.5: PPT 视觉确认（重要）
-
-HTML PPT 制作完成后，**必须暂停**，让用户确认视觉效果：
-
-1. **用浏览器打开 HTML 文件**：`open <deck-path>/index.html`
-2. **告知用户**：PPT 已生成，请在浏览器中检查效果，确认以下内容：
-   - 整体风格和主题是否满意
-   - 是否需要切换主题（按 T 键可实时切换）
-   - 幻灯片内容和排版是否需要调整
-   - 页数是否合适
-3. **等待用户确认后**，再进入 Phase 2
-
-这一步非常重要，避免在用户不满意的 PPT 上生成语音和视频，浪费计算时间。
-
-### Phase 2: 生成确认文档
-
-运行 `python build_video.py review`，脚本会自动完成：
-1. 渲染幻灯片为 PNG
-2. 生成 `video-output/review.md` 确认文档（包含每页的图片 + 解说词）
-
-确认文档格式：
-
-````markdown
----
-voice: zh-CN-YunxiNeural
-rate: "+5%"
-style: 口语化
-skip: []
----
-
-<!--
-说明：
-  - 每个 `# N · Title` 下有一个 `- [ ]` checkbox
-  - 取消勾选改为 `- [x]` 表示跳过该页（不生成语音和视频）
-  - 解说词在 code block 中，可直接编辑
-  - YAML 块中可修改 voice、rate、style 等参数
-  - 确认无误后告知继续
--->
-
-# 1 · Cover
-
-- [ ] **跳过此页**
-
-![slide](slides/index_01.png)
-
-```
-大家好，今天来聊聊如何用 MCP 构建能够触达生产系统的智能体。
-```
-
-# 2 · Agenda
-
-- [ ] **跳过此页**
-
-![slide](slides/index_02.png)
-
-```
-分享分为六个部分。先看三条连接路径的对比...
-```
-
-# 3 · 可跳过的页面
-
-- [x] **跳过此页**
-
-![slide](slides/index_03.png)
-
-```
-这页内容可以跳过...
-```
-````
-
-确认文档包含：
-- **YAML 块**：`voice`（语音）、`rate`（语速）、`style`（语言风格）、`skip`（全局跳过的页码列表）
-- **每页**：页码 + 标题 + checkbox + 幻灯片图片 + code block 包裹的解说词
-- **Checkbox**：`- [ ]` 表示保留，`- [x]` 表示跳过该页
-- **解说词**：用 code block（` ``` `）包裹，便于识别和编辑
-
-### Phase 3: 用户确认
-
-**把 `review.md` 展示给用户**，引导用户：
-
-1. 修改 YAML 块中的参数（换语音、调语速等）
-2. 直接编辑 code block 中的解说词
-3. 勾选 `- [x]` 跳过不需要的页面
-4. 确认无误后告知继续
-
-### Phase 4: 解析确认文档 + 生成视频
-
-用户确认后，运行 `python build_video.py build`，脚本会：
-
-1. **解析 `review.md`** — 读取 YAML 参数和解说词，识别 `- [x]` 跳过的页面
-2. **生成语音** — 对非跳过页面运行 edge-tts，生成 mp3 + srt
-3. **合并字幕** — 基于音频时长偏移合并 SRT
-4. **生成视频片段** — ffmpeg 用 `-t` 精确控制每段时长（不用 `-shortest`）
-5. **拼接 + 烧字幕** — 最终输出 `final-video.mp4`
-
-也可以单独重跑某个步骤：
 ```bash
-python build_video.py build          # 全部 5 步
-python build_video.py build --step 3  # 仅步骤 3（生成视频片段）
+PY=~/.venv-mlx-audio/bin/python
+$PY ~/ppt2video.py review deck/index.html
+```
+产出 `deck/video-output/`：
+- `slides/001.png …`（Edge 无头截图，1920×1080；编号 **3 位**，>99 页不乱序）
+- `outline.md`（提取出的每页文字）
+- `review.md`（**核心确认文档**）
+
+### Phase 2.5: 可选 —— 让 DGX 写解说词
+
+```bash
+$PY ~/ppt2video.py narrate deck/index.html
+```
+默认走 **DGX 上的 infersight 网关**（`http://100.89.119.47:9000/v1`，模型 `main`）—— 符合"LLM 流量必须经 infersight"的规则。
+可用环境变量覆盖：`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`。
+产出 `narrations.json`，`review --reset` 时自动填入 `review.md`。
+
+### Phase 3: 用户确认（改 review.md）
+
+`review.md` 顶部是 **YAML 配置块，这才是配置的真源**（改脚本里的 `DEFAULTS` 会被它覆盖）：
+
+```yaml
+ref_audio: /Users/<user>/voice.wav     # 参考录音（克隆音色）
+ref_text: 嗯，大家好，…                  # 必须与录音一字不差
+instruct:                                # ⚠️ 克隆模式下无效，见「坑」
+speed: 1.15                              # ✅ 基线（ffmpeg atempo 后处理）
+subtitles: burn                          # burn 烧录 / soft 软字幕 / off
 ```
 
-## Critical Pitfalls
+每页：`# N · 标题` + `- [ ]` checkbox + 图片 + ``` 代码块里的解说词 ```。
+勾成 `- [x]` 跳过该页。
 
-### ffmpeg 时间漂移（最重要）
+### Phase 4: 出片
 
-`-loop 1` 静态图 + `-shortest` 会因帧对齐导致每段多 ~2s，累积后字幕完全错位。
+```bash
+$PY ~/ppt2video.py build deck/index.html
+```
+1. 一页的所有句子一次 `batch_generate`（共享参考条件 → 句间音色稳）
+2. 每句独立音频 → 字幕起止时间 = **真实音频时长**（不是估算）
+3. 按 `speed` 做 atempo 变速（**只重跑 ffmpeg，缓存复用，约 2 秒**）
+4. **只合成一次音轨、一次视频**（不逐页切片再拼）→ 结构上无累积漂移
+5. `-t <总时长>` 硬截断 → 视频与音轨严格等长
 
-必须用 `-t <exact_audio_duration>` 精确控制每段时长，不依赖 `-shortest`。
+## Critical Pitfalls（全部实测踩过）
 
-### 字幕偏移计算
+### ① 模型路径必须是本地绝对路径
+用 HuggingFace 仓库 ID（如 `mlx-community/Qwen3-TTS-...`）会触发联网下载，
+而**本机 HF 直连被墙**（`SSL: UNEXPECTED_EOF`）。`load_model` 只认本地目录。
+**另**：mlx-audio 要求目录里有 **`config.json`**；魔搭上的**官方 PyTorch 版只有 `config.yaml`**，
+直接下会加载失败（`Config not found`）—— **必须下 `mlx-community/*` 的 MLX 转换版**。
 
-合并 SRT 时，时间偏移基于 ffprobe 获取的音频文件时长累加，不基于 SRT 结束时间。
+### ② 克隆模式不支持 instruct（库明确拒绝）
+```
+ValueError: Qwen3-TTS batch reference cloning does not support instructs
+```
+→ **语气只能靠"换参考录音"**：参考里什么情绪，输出就是什么情绪。
 
-### 中文 ASS 字幕样式
+### ③ 模型自带的 speed 参数在克隆模式无效
+实测同一句话：`speed=1.0→4.72s`、`1.15→4.96s`、`0.85→4.64s` ——
+差异（±5%）小于采样噪声。**变速只能靠 ffmpeg `atempo`**（保音高）。
 
-SRT 转 ASS 后需替换默认样式（Noto Sans SC，字号 12，白字黑边）。ffmpeg subtitles filter 的路径需绝对路径且冒号转义：`path.replace(":", "\\:")`。
+### ④ 不设 repetition_penalty 会翻车
+实测不设（=1.0）时，44 字念出 **32.00 秒**（一路念满 `max_tokens`）。
+官方 `generation_config.json` 要求 **1.05**。脚本在 4 次重试里**逐次加大**（1.05→1.29）。
+
+### ⑤ review.md 覆盖脚本 DEFAULTS
+配置真源是 `review.md`。改了脚本默认值但没跑 `review --reset`，build 仍用旧配置。
+
+### ⑥ ffconcat 最后一帧导致最后一页播两遍
+`list.ffconcat` 末行重复的 `file` 没有 `duration`，ffmpeg 补一次默认时长
+（实测日志 24.67s → 视频 30.57s）。**修法：mux 加 `-t <总时长>` 硬截断。**
+
+### ⑦ 短句音色偏弱，但不要合并
+实测"大家好。"（4 字，0.8s）与其他句的声纹相似度只有 0.91~0.94，长句是 0.96~0.99。
+**试过并入下一句（音色升到 0.99），但用户判断更难听 —— 停顿被吃掉了。**
+→ **保留句边界和停顿**，接受短句略弱。
+
+### ⑧ `batch_generate` 的参数是复数
+`instructs=[...]`（列表），不接收单数 `instruct`；`texts=[...]`。
 
 ## Output Structure
 
 ```
-project/
-├── build_video.py
-└── video-output/
-    ├── slides/           # N 个 PNG (1920x1080)
-    ├── review.md         # 用户确认文档（核心）
-    ├── narrations/       # txt 文件
-    ├── audio/            # mp3 + srt
-    ├── segments/         # mp4 片段
-    ├── subtitles/        # combined.srt + combined.ass
-    └── final-video.mp4   # 最终视频
+deck/video-output/
+├── slides/001.png …       # Edge 无头截图 1920×1080
+├── outline.md             # 提取的每页文字
+├── review.md              # ★ 配置真源 + 解说词 + 逐页确认
+├── narrations.json        # narrate 产出（可选）
+├── tts-cache/             # 句子级缓存（含 *_x1.15.wav 变速产物）
+├── narration.wav          # 合成后的完整音轨
+├── list.ffconcat          # 视频帧序列
+├── subs.srt               # 字幕（句级真实时长）
+└── final-video.mp4        # ★ 成片
 ```
 
-## Voice Options
+## Tuning（三项可调，均已实测）
 
-| 语音 ID | 性别 | 风格 |
-|---------|------|------|
-| zh-CN-YunxiNeural | 男 | 沉稳（推荐技术分享） |
-| zh-CN-XiaoxiaoNeural | 女 | 亲切自然 |
-| zh-CN-YunjianNeural | 男 | 磁性浑厚 |
-| zh-CN-XiaoyiNeural | 女 | 活泼明快 |
+| 想调 | 怎么调 | 成本 |
+|---|---|---|
+| **速度** | 改 `review.md` 的 `speed:`（1.0~1.2 自然，>1.25 听得出）| ✅ **约 2 秒重出片**（缓存复用，只跑 ffmpeg）|
+| **情感/语气** | **重录一条那个情绪的参考录音** + 改 `ref_audio`/`ref_text` | ⚠️ 要重新合成 |
+| **音色** | 同上 | ⚠️ 同上 |
+
+参考录音要求：**3~10 秒、内容连贯（不要几段不相干的话）、包含会用到的词（尤其数字）、
+无"嗯"等口头语、语速平稳、安静环境一条到底**。
+（实测：参考文本里含"大家好"时，合成"大家好"相似度 0.9647；不含时只有 0.9318。）
+
+## 与上游的差异
+
+| # | 上游 | 本地版 | 依据 |
+|---|---|---|---|
+| 1 | `render.sh` 截图 | 直接调浏览器（Edge/Chrome 自动探测）| M2 无 Chrome；render.sh 是 html-ppt skill 的可选脚本 |
+| 2 | 手工确认页数 | 自动识别 `<section class="slide">` | 减少一步人工 |
+| 3 | edge-tts（在线）| **mlx-audio Qwen3-TTS 克隆**（edge-tts 保留为备选）| 要克隆本人音色；且不依赖在线服务 |
+| 4 | 按页估算字幕时间 | **按句合成，起止=真实音频时长** | 字幕精度 |
+| 5 | 逐页 mp4 片段 + concat | **一次音轨 + 一次视频** | 上游"Critical Pitfalls"自己写的 `-shortest` 漂移问题，从结构上根除 |
+| 6 | 无缓存 | **句子级 TTS 缓存** | 改一页只重合成改动那几句 |
+| 7 | 解说词靠 agent 手写 | **`narrate` 直连 DGX infersight** | 不需要 agent 框架 |
+| 8 | brew ffmpeg + ffprobe | `imageio-ffmpeg` 静态二进制（自带 libass）| M2 没 brew；且不需要 ffprobe（时长用 Python 的 wave 读）|
+| 9 | Noto Sans SC | PingFang SC（macOS 自带）| 不额外装字体 |
+| 10 | 4 个 edge-tts 音色 | **克隆本人音色** + 上述三项调参 | — |
+| 11 | 无 `-t` 兜底 | mux 加 `-t <总时长>` | 修 ffconcat 末帧播两遍 |
+| 12 | 无时长合理性检查 | 按字数判定（0.16~0.50 s/字），异常重试并逐次加大重复惩罚 | 防翻车 |
 
 ## Troubleshooting
 
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| 后半段字幕不同步 | -shortest 漂移 | 改用 -t 精确时长 |
-| 字幕字体太大 | ASS 默认字号 | 改 Style 行字号 |
-| 中文方块 | 缺中文字体 | 用 Noto Sans SC |
-| ffmpeg 路径报错 | 冒号未转义 | replace(":", "\\:") |
-| 换模板后视频没变 | build 未重新渲染 | 先 render 或跑 review 再 build |
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| `Config not found` | 下的是官方 PyTorch 版（只有 config.yaml）| 换 `mlx-community/*` 的 MLX 版 |
+| HF 连接超时 | 用了 HF 仓库 ID | 改成本地绝对路径 |
+| `does not support instructs` | 克隆模式不支持 instruct | 去掉 instruct，改用参考录音控制语气 |
+| 某句音色突然不像 | 该句过短（<1 秒）| 正常现象；可把该句写长一点 |
+| 视频比日志长一页 | ffconcat 末帧缺 duration | 已有 `-t` 兜底；若仍出现检查 `total` 计算 |
+| 截图全是同一页 | deck 不支持 `#/N` 翻页 | reveal.js 用 `--hash-start 0` |
+| 改了配置没生效 | `review.md` 覆盖了 DEFAULTS | 直接改 `review.md`，或 `review --reset` |
+| 字幕是方块 | 字体缺失 | 本版用 PingFang SC；换机器需确认系统有中文字体 |
