@@ -283,6 +283,12 @@ def render(deck, out, n, start):
                 b.close()
                 sys.exit(f"第 {i} 页截图失败（检查浏览器能否用 #/N 翻页，reveal.js 试 --hash-start 0）")
             print(f"  ✔ slides/{png.name}")
+    _hs = [hashlib.sha1((d / f"{x:03d}.png").read_bytes()).hexdigest() for x in range(1, n + 1)]
+    _dup = [x for x in range(2, n + 1) if _hs[x - 1] == _hs[x - 2]]
+    if len(set(_hs)) == 1 and n > 1:
+        sys.exit("所有截图完全相同：deck 不支持 #/N 翻页，或 --hash-start 设错（reveal.js 试 0）")
+    if _dup:
+        print(f"  ⚠ 第 {_dup} 页与前一页截图完全相同，检查翻页")
         b.close()
 
 
@@ -855,7 +861,9 @@ def cmd_check():
     if FFMPEG:
         print(f"      {FFMPEG}")
         row(has_libass(), "烧录字幕（libass）", "不支持，将自动改用软字幕", required=False)
-    row(CHROME is not None, "浏览器（Edge/Chrome）", "装 Edge 或用 BROWSER 指定")
+    _pw = importlib.util.find_spec("playwright") is not None
+    row(_pw, "截图引擎（Playwright）", "pip install playwright && playwright install chromium")
+    row(CHROME is not None, "本机浏览器（仅备用）", "可不装；没 Playwright 时才会用", False)
     if CHROME:
         print(f"      {CHROME}")
     row(importlib.util.find_spec("mlx_audio") is not None, "mlx-audio", "pip install mlx-audio", False)

@@ -128,7 +128,8 @@ def test_speak_rules_machine_independent():
     """只验规则本身（不依赖 cn2an）：年份逐位读、1200 年不误伤、≥1 亿的万元折成亿元。
     中文读法的最终转换由 cn2an 完成，只在装了的机器（出片机）上生效。"""
     assert "二零二六" in m.speak("2026 年")
-    assert "1200 年" in m.speak("1200 年历史")            # 四位非 19/20/21xx 不当年份
+    _y = m.speak("1200 年历史")                          # 四位非 19/20/21xx 不当年份
+    assert "年历史" in _y and "到" not in _y               # 装着 cn2an 时会变「一千二百年历史」，所以不能断言数字形态
     assert "亿元" in m.speak("100000 万元") and "万元" not in m.speak("100000 万元")
     assert "万元" in m.speak("7300 万元")                  # 千万级保持万元
     assert "1200" not in m.speak("2026 年")                # 不许念成"二零二六年"以外的形式
