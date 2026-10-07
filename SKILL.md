@@ -71,6 +71,7 @@ $PY $P2V review-ui  deck/index.html                   # 审核台（本机起，
 - ⚠ **deck 项目若纳入 git**：`review.md` 里有参考录音路径与逐字文本，`video-output/` 要加进 `.gitignore`
   （本仓库的 `.gitignore` 已忽略 `video-output/` 与 `*-video/`，deck 项目要自己加）
 - `data-sec="45"` = 本页解说词的**目标秒数**（绝对秒，不是权重）；`<div class="notes">` = 讲述要点，也是数字溯源依据
+- **封面/目录/章节页/结尾页是例外**：字数下限只按它们的 `data-sec` 推算，不套内容页的全局下限
 - **免责默认关闭**：deck 不做免责页，解说词也不写免责/声明/风险提示；只有 owner 明确要求才用 `--disclaimer`
 - **停下来 → Gate ②**：owner 看画面 + 解说词
 

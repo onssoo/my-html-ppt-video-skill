@@ -316,3 +316,22 @@ def test_project_pronounce_must_be_loaded_before_fingerprint(tmp_path):
     assert m.load_cps(out, cfg) != 4.43
     m.PRON.clear(); m.load_pron(out, tmp_path)              # 加载后恢复正常
     assert m.load_cps(out, cfg) == 4.43
+
+
+# ── 封面/结尾这类非内容页是内容页规则的例外（owner 2026-10-07）──────
+def test_non_content_slide_detection():
+    cover = {"title": "某材料公司", "cls": "slide cover", "sec": 12, "fixed": None}
+    body = {"title": "海外客户合计约 77%", "cls": "slide", "sec": 45, "fixed": None}
+    assert m.slide_is_non_content(cover, 1, 3) is True        # 首页 = 封面
+    assert m.slide_is_non_content(cover, 3, 3) is True        # 末页 = 结尾
+    assert m.slide_is_non_content({"title": "目录", "cls": "", "sec": 15}, 2, 5) is True
+    assert m.slide_is_non_content({"title": "正文", "cls": "", "sec": 15, "fixed": 15}, 2, 5) is True
+    assert m.slide_is_non_content(body, 2, 3) is False
+
+
+def test_non_content_pages_exempt_from_global_floor():
+    """12 秒封面页的下限是规范的 43 字，而不是全局下限 100 字。"""
+    spec = m.char_range(12, 4.5)[0]
+    assert m.page_floor(12, 100, 4.5, content=False) == spec          # 封面：豁免
+    assert m.page_floor(12, 100, 4.5, content=True) == 100            # 内容页：仍是 100
+    assert m.page_floor(45, 100, 4.5, content=True) == m.char_range(45, 4.5)[0]   # 162 > 100

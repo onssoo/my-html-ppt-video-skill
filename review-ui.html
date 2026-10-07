@@ -304,7 +304,7 @@ function renderN() {
   $('#n-title').textContent = `第 ${cur.n} 页 · ${b.title || ''}`;
   $('#n-pill').textContent = b.fixed ? '固定秒数' : (b.disc ? '免责页' : '');
   $('#n-text').value = d.text || '';
-  $('#n-range').textContent = b.lo ? `${b.lo}–${b.hi}` : '—';
+  $('#n-range').textContent = b.lo ? (b.hi ? `${b.lo}–${b.hi}` : `≥${b.lo}`) : '—';
   updateCount();
   const g = (ST.ground || {})[String(cur.n)];
   const gb = $('#n-ground'); gb.innerHTML = '';

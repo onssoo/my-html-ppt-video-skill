@@ -208,6 +208,7 @@ class SlideParser(HTMLParser):
             if self.depth == 0 and "slide" in (a.get("class") or "").split():
                 self.depth = 1
                 self.slides.append({"title": (a.get("data-title") or "").strip(),
+                                   "cls": (a.get("class") or "").strip(),
                                     "sec": int(a["data-sec"]) if (a.get("data-sec") or "").isdigit() else None,
                                     "fixed": a.get("data-fixed"),
                                     "disc": "data-disclaimer" in a,
@@ -1054,10 +1055,34 @@ def grounding(out, tdir, s, brief=""):
     return "\n".join(parts)
 
 
-def page_floor(sec, lo, cps=CPS):
-    """【单版本模式】有 data-sec 时按规范 0.8× 推字数下限，否则用全局 lo。只设下限不设上限。"""
+def slide_is_non_content(s, i, n):
+    """这一页算不算「非内容页」（封面 / 目录 / 章节页 / 结尾页）。
+
+    owner 2026-10-07：封面页与结尾页这类**没有正文内容**的页是例外——
+    内容页的密度与字数下限规则不套在它们身上。命中任一条即算非内容页：
+      1. 首页（封面）或末页（结尾）；
+      2. 显式标了 fixed（按约定固定秒数的页就是封面/目录/结尾）；
+      3. 标题里有 NON_CONTENT 的词（封面/目录/章节/结尾/封底/致谢）；
+      4. `<section>` 的 class 命中非内容版式名（cover / toc / divider / section…）。"""
+    if i in (1, n):
+        return True
+    if s.get("fixed"):
+        return True
+    blob = f"{s.get('title', '')} {s.get('cls', '')}"
+    if any(k in blob for k in NON_CONTENT):
+        return True
+    return bool(set(re.split(r"\s+", (s.get("cls") or "").lower())) & NON_CONTENT_TPL)
+
+
+def page_floor(sec, lo, cps=CPS, content=True):
+    """【单版本模式】每页字数下限。
+
+    内容页 = max(全局下限 lo, 规范 §八 的 0.8× 推算)；
+    **非内容页（封面/目录/章节/结尾）= 只按自己的 sec 推算，不套全局下限**——
+    否则 12 秒的封面页会被要求 100 字（≈22 秒语音），整片被拉长。"""
     if sec:
-        return max(lo, char_range(sec, cps)[0])
+        spec = char_range(sec, cps)[0]
+        return max(lo, spec) if content else spec
     return lo
 
 
@@ -1280,7 +1305,8 @@ def cmd_narrate(out, slides, v=None, source=None, pages=None,
             lo_i, hi_i = char_range(secs[i], cps, strict=True)
             total_chars += c
         else:
-            lo_i, hi_i = page_floor(pg["sec"], lo, cps or CPS), None
+            _content = not slide_is_non_content(pg, i, n)
+            lo_i, hi_i = page_floor(pg["sec"], lo, cps or CPS, content=_content), None
         system = NARRATE_SYSTEM.format(
             disclaimer=((DISCLAIMER if disc else "本页不涉及财务预测，不要说免责语。")
                         if DISCLAIMER_ON else NO_DISC_RULE),
@@ -1791,7 +1817,8 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
         if secs:
             lo, hi = char_range(secs[i], cps, strict=True)
         else:
-            lo = page_floor(s["sec"], 100)
+            _content = not slide_is_non_content(s, i, len(slides))
+            lo = page_floor(s["sec"], 100, cps, content=_content)
         txt = narr.get(str(i), "").strip()
         n = len(re.sub(r"\s", "", txt))
         grounded = grounding(out, tdir, s)
@@ -2325,7 +2352,9 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                     if v and _i in v["skip"]:
                         continue
                     _sec = _secs.get(_i, _s.get("sec") or 45)
-                    _lo, _hi = char_range(_sec, cps, strict=bool(v))
+                    _content = not slide_is_non_content(_s, _i, len(_sl))
+                    _lo = page_floor(_sec, 100, cps, content=_content)
+                    _hi = char_range(_sec, cps, strict=True)[1] if v else None
                     budget.append({"n": _i, "title": _s["title"], "kind": "", "weight": None,
                                    "fixed": None, "disc": bool(_s.get("disc")),
                                    "sec": round(_sec, 1), "lo": _lo, "hi": _hi})
