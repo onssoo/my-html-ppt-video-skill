@@ -2,7 +2,7 @@
 
 跑法：python -m pytest tests/ -q        （只测确定性逻辑，不碰 TTS / LLM / 浏览器）
 """
-import importlib.util, re, sys
+import importlib.util, json as _json, re, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -265,3 +265,37 @@ def test_redo_clears_that_pages_cache_only(tmp_path):
             f.unlink()
     assert not list(cache.glob(a + "*"))                  # 第 1 页清干净（含变速副本）
     assert len(list(cache.glob(b + "*"))) == 2            # 第 2 页原样
+
+
+# ── 自查抓到的两条 NameError（测试原先没覆盖的路径）──────────
+def test_review_narration_diff(tmp_path):
+    """review.md 与 narrations.json 不一致的页要能列出来（build 走这条）。"""
+    tdir = tmp_path / "vo"; tdir.mkdir()
+    (tdir / "narrations.json").write_text(
+        _json.dumps({"1": "一样", "2": "旧的"}, ensure_ascii=False), encoding="utf-8")
+    pages = [(1, "一样"), (2, "新的"), (3, "只有 review 有")]
+    assert m.review_narration_diff(tdir, pages) == [2, 3]
+    assert m.review_narration_diff(tmp_path / "nope", pages) == []      # 没文件 → 不报
+
+
+def test_cmd_review_doc_runs(tmp_path):
+    """cmd_review_doc 全流程能跑通（原来 tot_t 引用了已删除的变量 c，会 NameError）。"""
+    out = tmp_path / "video-output"; out.mkdir()
+    deck = tmp_path / "deck.pptx"; deck.write_text("x")   # 非 html，跳过截图
+    slides = [{"title": "封面", "text": ["甲"], "notes": [], "sec": 12, "fixed": None, "disc": False},
+              {"title": "正文", "text": ["乙"], "notes": [], "sec": 40, "fixed": None, "disc": False}]
+    (out / "slides.json").write_text(_json.dumps(slides, ensure_ascii=False), encoding="utf-8")
+    m.cmd_review(str(deck), out, slides, reset=False, start=1)
+    # 字数要够各页下限（12 秒 → 43 字；40 秒 → 144 字），否则 lint 会判偏短、返回 1
+    long1 = "这是封面页的解说词，需要足够长才能过字数下限，所以这里多写一些内容。"
+    long2 = ("这一页讲正文内容，先给结论，再说明依据。"          # ~19
+             "第一条依据来自源文档的口径表，数字保持原样不改。"   # ~24
+             "第二条依据说明前提条件，落地时间取决于重整进度。"   # ~24
+             "第三条说明它对公司的意义，也就是收入结构的改善。"   # ~24
+             "最后把这三条串起来，指出它们共同指向产能释放。"     # ~23
+             "以上判断都基于现有材料，没有引入材料之外的信息。")   # ~24
+    (out / "narrations.json").write_text(
+        _json.dumps({"1": long1, "2": long2}, ensure_ascii=False), encoding="utf-8")
+    rc = m.cmd_review_doc(str(deck), out, None, str(tmp_path / "审定稿.md"))
+    assert rc == 0
+    assert (tmp_path / "审定稿.md").exists()

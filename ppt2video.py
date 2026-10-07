@@ -1004,6 +1004,18 @@ def llm(system, user, image=None):
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
 
+def review_narration_diff(tdir, pages):
+    """review.md 与 narrations.json 哪些页不一致（build 以 review.md 为准）。"""
+    nj = Path(tdir) / "narrations.json"
+    if not nj.exists():
+        return []
+    try:
+        d = json.loads(nj.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return [n for n, x in pages if d.get(str(n), "").strip() != (x or "").strip()]
+
+
 def update_review(rv, narr, pages):
     txt = rv.read_text(encoding="utf-8")
     for i in pages:
@@ -1518,10 +1530,9 @@ def cmd_build(out, slides, v=None, deck=None, force=False):
         if redo:
             print(f"重录标记：第 {sorted(redo)} 页 —— 会清掉这些页的句子缓存再合成")
     cfg, pages = parse_review(rv)
-    _njd = json.loads(nj.read_text(encoding="utf-8")) if nj.exists() else {}
-    _diff = [n for n, x in pages if _njd.get(str(n), "").strip() != (x or "").strip()]
-    if _diff:
-        print(f"⚠ 第 {_diff} 页 review.md 与 narrations.json 不一致，**以 review.md 为准**"
+    _mm = review_narration_diff(tdir, pages)
+    if _mm:
+        print(f"⚠ 第 {_mm} 页 review.md 与 narrations.json 不一致，**以 review.md 为准**"
               "（要同步：narrate --pages，或在审核台把该页重存一次）")
     pages = [(n, t) for n, skip, t in pages if not skip]
     bad = [n for n, t in pages if not t or t == PLACEHOLDER]
@@ -1755,7 +1766,13 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
     """Gate 2：逐页解说词审定稿——画面要点 / 讲述要点（降序）/ 解说词 / 字数 vs 目标 / lint。
     lint 只卡下限，版本模式下上限就是时长控制本身，所以这里按 narrate 的同一容忍度补一条上限检查。"""
     tdir = v["dir"] if v else Path(out)
-    slides = load_slides(deck, out)
+    try:
+        slides = load_slides(deck, out)
+    except SystemExit:
+        raise
+    except Exception as e:                     # 坏 PPTX / 缺 slides.json 等：给人话，不要 traceback
+        sys.exit(f"读不了这份幻灯片（{type(e).__name__}: {str(e)[:80]}）。\n"
+                 f"  路线 B 请先跑 import；或确认文件没损坏、是幻灯片版式（不是 A4 报告）")
     cps = load_cps(out)
     secs = page_seconds(slides, v["minutes"] * 60, v["skip"]) if v else None
     nj = tdir / "narrations.json"
@@ -1782,7 +1799,7 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
         nbad += bool(iss)
         tot += n
         rng = f"{lo}–{hi}" if hi else f"≥{lo}"
-        tot_t += c if secs else lo                     # 用区间中值做"目标"，上限只是容忍边界
+        tot_t += ((lo + hi) // 2 if secs else lo)      # 目标取区间中值，上限只是容忍边界
         rows.append(f"| {i} | {s['title']} | {secs[i]:.0f}s | {rng} | {n} | "
                     f"{'✔' if not iss else '✘ ' + '；'.join(iss)} |" if secs else
                     f"| {i} | {s['title']} | — | {rng} | {n} | {'✔' if not iss else '✘ ' + '；'.join(iss)} |")
@@ -1810,6 +1827,7 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
     dest.write_text("\n".join(L + blocks), encoding="utf-8")
     print(f"已写入 {dest}：{tot} 字" + (f" / 目标 {tot_t}" if v else "")
           + (f"，lint 未过 {nbad} 页" if nbad else "，lint 全绿"))
+    return 1 if nbad else 0
 
 
 def cmd_qc(deck, out, v=None, out_path=None):
@@ -2597,7 +2615,13 @@ def main():
         return cmd_review_doc(deck, out, v, a.out)
     if a.cmd == "qc":                          # Gate 3：成片质检报告
         return cmd_qc(deck, out, v, a.out)
-    slides = load_slides(deck, out)
+    try:
+        slides = load_slides(deck, out)
+    except SystemExit:
+        raise
+    except Exception as e:                 # 坏 PPTX / 缺 slides.json：给人话，不要 traceback
+        sys.exit(f"读不了这份幻灯片（{type(e).__name__}: {str(e)[:80]}）。\n"
+                 "  路线 B 请先跑 import；或确认文件没损坏、是幻灯片版式（不是 A4 报告）")
     if not slides:
         sys.exit('没找到幻灯片：HTML 需要 <section class="slide">；PPTX/PDF 请确认是幻灯片版式')
     if a.cmd == "build":
