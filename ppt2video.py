@@ -1326,6 +1326,25 @@ def mux(out, cfg, total, fontdir=None, name="final-video.mp4"):
 # 记录"哪一次审核通过时，这些文件是什么哈希"。build 前比对：变过就拒绝，
 # 除非显式 --force。这样 SKILL.md 里"deck 一改必须重跑 review"的提醒由代码保证。
 
+def out_dir(deck):
+    """输出目录：HTML → video-output/；PPTX/PDF → <文件名>-video/。
+    所有命令都用这一个，别再各写一份（否则路线 B 的审核台/预览找不到文件）。"""
+    d = Path(deck).resolve()
+    return d.parent / ("video-output" if d.suffix.lower() in (".html", ".htm") else f"{d.stem}-video")
+
+
+def gate_files(deck, out, tdir):
+    """出片前要比对的文件。review.md 是 build 的真源，必须在清单里。"""
+    f = {"deck": Path(deck), "narrations": Path(tdir) / "narrations.json",
+         "review": Path(tdir) / "review.md"}
+    if Path(out, "slides.json").exists():
+        f["slides"] = Path(out, "slides.json")       # 路线 B 的 sec / notes 改在这里
+    omd = find_outline_md(deck)
+    if omd:
+        f["大纲"] = omd
+    return f
+
+
 def file_sha(p):
     p = Path(p)
     return hashlib.sha1(p.read_bytes()).hexdigest()[:12] if p.exists() else None
@@ -1344,6 +1363,7 @@ def gates_load(out):
 
 def gates_approve(out, gate, files):
     """把某道门的通过状态与文件哈希写进 gates.json。"""
+    Path(out).mkdir(parents=True, exist_ok=True)
     d = gates_load(out)
     d.setdefault("gates", {})[gate] = {
         "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1360,7 +1380,7 @@ def gates_stale(out, gate, files):
     bad = []
     for name, path in files.items():
         old = (rec.get("files", {}).get(name) or {}).get("sha")
-        if old and file_sha(path) != old:
+        if old is None or file_sha(path) != old:   # 审核时不存在 = 没审过
             bad.append(name)
     return bad
 
@@ -1397,24 +1417,24 @@ def cmd_gates(out, deck=None):
 def cmd_build(out, slides, v=None, deck=None, force=False):
     tdir = v["dir"] if v else Path(out)          # 解说词/中间件/成片随版本走；画面和缓存共用
 
-    # —— 审核状态门禁：deck / 解说词 / 大纲 在通过审核之后又被改过 → 拒绝出片 ——
-    _files = {"narrations": tdir / "narrations.json"}
-    if deck:
-        _files["deck"] = deck
-        _omd = find_outline_md(deck)
-        if _omd:
-            _files["大纲"] = _omd
-    _stale = gates_stale(out, "review", _files)
-    if _stale and not force:
-        print("✘ 这些文件在通过审核之后被改过，需要重审（或在确知没影响时用 --force）："
-              + "、".join(_stale))
-        return 2
+    # —— 门禁（Gate 2）：文件在通过审核之后被改过、或从没审过 → 拒绝出片 ——
+    _files = gate_files(deck, out, tdir) if deck else {"narrations": tdir / "narrations.json"}
+    _stale = gates_stale(out, "narration", _files)
     if _stale is None:
-        print("· 还没有审核记录（gates.json 为空）：建议先跑 review-ui 过一道 Gate 2")
+        _stale = ["（还没通过 Gate 2）"]
+    if _stale and not force:
+        print("✘ 不能出片：" + "、".join(_stale)
+              + "。先在审核台过 Gate 2；确知没影响才用 --force（agent 不得自行使用）")
+        return 2
     rv = tdir / "review.md"
     if not rv.exists():
         sys.exit("先运行 review")
     cfg, pages = parse_review(rv)
+    _njd = json.loads(nj.read_text(encoding="utf-8")) if nj.exists() else {}
+    _diff = [n for n, x in pages if _njd.get(str(n), "").strip() != (x or "").strip()]
+    if _diff:
+        print(f"⚠ 第 {_diff} 页 review.md 与 narrations.json 不一致，**以 review.md 为准**"
+              "（要同步：narrate --pages，或在审核台把该页重存一次）")
     pages = [(n, t) for n, skip, t in pages if not skip]
     bad = [n for n, t in pages if not t or t == PLACEHOLDER]
     if bad:
@@ -1629,7 +1649,7 @@ def cmd_outline(path, out_path=None):
 def cmd_deck_pdf(deck, out_path=None):
     """Gate 2：把 out/slides/*.png 拼成一份 PDF——像 PPT 一样翻着审。"""
     from PIL import Image
-    out = Path(deck).resolve().parent / "video-output"
+    out = out_dir(deck)
     ps = sorted((out / "slides").glob("*.png"))
     if not ps:
         sys.exit("还没有截图，先跑 review")
@@ -2078,11 +2098,11 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
     tgt = Path(target).resolve()
     if not tgt.exists():
         sys.exit(f"没有 {tgt}")
-    is_deck = tgt.suffix.lower() in (".html", ".htm")
+    is_deck = tgt.suffix.lower() in (".html", ".htm", ".pptx", ".pdf")
     deck = str(tgt) if is_deck else (tgt.parent / "index.html" if (tgt.parent / "index.html").exists() else None)
     work = tgt.parent
     oj = (work / "outline.json") if not is_deck else ((work.parent / "outline.json") if (work.parent / "outline.json").exists() else (work / "outline.json"))
-    out = Path(deck).parent / "video-output" if deck else work / "video-output"
+    out = out_dir(deck) if deck else work / "video-output"
     v = load_version(deck, out, version) if (version and deck) else None
     tdir = v["dir"] if v else out
     roots = [work, work.parent, out, tdir]
@@ -2101,6 +2121,10 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
         try:
             sl = load_slides(deck, out)
         except SystemExit:
+            return []
+        except Exception as e:                    # 坏 PPTX / 缺 slides.json：别让整个响应崩掉
+            print(f"⚠ 读幻灯片失败（{type(e).__name__}: {str(e)[:60]}）："
+                  "路线 B 请先跑 import；这里只显示大纲与解说词")
             return []
         ps = sorted((out / "slides").glob("*.png"))
         res = []
@@ -2226,7 +2250,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             if u.path == "/file":
                 q = urllib.parse.parse_qs(u.query).get("p", [""])[0]
                 p = Path(q).resolve()
-                if not any(str(p).startswith(str(r)) for r in roots) or not p.is_file():
+                if not any(p.is_relative_to(Path(r).resolve()) for r in roots) or not p.is_file():
                     return self._send(403, b'{"error":"forbidden"}')
                 ctype = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
                 size = p.stat().st_size
@@ -2317,6 +2341,13 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                 nj.write_text(json.dumps(dict(sorted(narr.items(), key=lambda kv: int(kv[0]))),
                                          ensure_ascii=False, indent=2), encoding="utf-8")
                 changes.append(f"解说词第 {i} 页：{old} → {len(re.sub(r'\\s', '', txt))} 字")
+                rv = tdir / "review.md"
+                if rv.exists():                        # build 以 review.md 为准，必须同步
+                    try:
+                        update_review(rv, narr, [i])
+                        changes.append(f"review.md 第 {i} 页已同步")
+                    except Exception as e:
+                        print(f"⚠ 同步 review.md 失败：{type(e).__name__}: {e}")
                 st = build_state()
                 return self._send(200, json.dumps(st, ensure_ascii=False).encode())
             if g == "redo":
@@ -2326,12 +2357,12 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                 return self._send(200, b'{"ok":true}')
             if g == "done":
                 try:                                   # 记下"这次通过时这些文件是什么哈希"
-                    gates_approve(out, "review", {
-                        "deck": deck or str(tgt),
-                        "narrations": tdir / "narrations.json",
-                        **({"大纲": omd} if omd else {}),
-                    })
-                    changes.append("已记录审核状态（gates.json）")
+                    stage = req.get("tab") or gate or "narration"
+                    files = gate_files(deck, out, tdir) if deck else {"narrations": tdir / "narrations.json"}
+                    if omd:
+                        files["大纲"] = omd
+                    gates_approve(out, stage, files)
+                    changes.append(f"已记录 {stage} 审核状态（gates.json）")
                 except Exception as e:
                     print(f"⚠ 写 gates.json 失败：{type(e).__name__}: {e}")
                 log = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "target": str(tgt),
@@ -2425,8 +2456,6 @@ def main():
         if not a.deck:
             ap.error("outline 需要 outline.json 路径")
         return cmd_outline(a.deck, a.out)
-    if a.cmd == "gates":
-        return cmd_gates(out if a.deck else Path("."), a.deck)
     if a.cmd == "deck-skeleton":               # 大纲 → deck 骨架（规范 §六）
         if not a.deck:
             ap.error("deck-skeleton 需要 大纲.md 路径")
@@ -2440,7 +2469,9 @@ def main():
     deck = str(Path(a.deck).resolve())
     is_html = Path(deck).suffix.lower() in (".html", ".htm")
     # PPTX/PDF 各用一个 <文件名>-video/，同一个目录里放多份幻灯片也不会互相覆盖
-    out = Path(deck).parent / ("video-output" if is_html else f"{Path(deck).stem}-video")
+    out = out_dir(deck)
+    if a.cmd == "gates":
+        return cmd_gates(out, deck)
     out.mkdir(exist_ok=True)
     if a.cmd == "import":
         if a.version:

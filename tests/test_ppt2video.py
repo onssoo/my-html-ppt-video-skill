@@ -175,3 +175,33 @@ def test_gates_approve_then_stale(tmp_path):
         m.cmd_build(str(out), [{"title": "a", "sec": 10, "text": [], "notes": []}],
                     deck=str(deck)) == 2                             # build 拒绝
     assert m.gates_stale(tmp_path / "nowhere", "review", {}) is None  # 从没审过
+
+
+# ── 批 1：输出目录统一 / 门禁收紧 / 无记录即拦 ──────────────
+def test_out_dir_html_vs_pptx(tmp_path):
+    h = tmp_path / "deck.html"; h.write_text("x")
+    p = tmp_path / "路演.pptx"; p.write_text("x")
+    assert m.out_dir(h).name == "video-output"
+    assert m.out_dir(p).name == "路演-video"
+
+
+def test_gate_files_includes_review_md(tmp_path):
+    deck = tmp_path / "deck.html"; deck.write_text("x")
+    out = tmp_path / "video-output"; out.mkdir()
+    f = m.gate_files(str(deck), str(out), str(out))
+    assert set(f) >= {"deck", "narrations", "review"}      # review.md 是 build 的真源
+
+
+def test_gates_stale_treats_missing_at_approval_as_stale(tmp_path):
+    out = tmp_path / "vo"; out.mkdir()
+    rv = out / "review.md"
+    m.gates_approve(out, "narration", {"review": rv})       # 审核时 review.md 还不存在
+    rv.write_text("later", encoding="utf-8")                # 后来才生成 → 等于没审过
+    assert m.gates_stale(out, "narration", {"review": rv}) == ["review"]
+
+
+def test_build_refuses_without_any_gate_record(tmp_path):
+    out = tmp_path / "vo"; out.mkdir()
+    deck = tmp_path / "deck.html"; deck.write_text("x")
+    rc = m.cmd_build(str(out), [{"title": "a", "sec": 10, "text": [], "notes": []}], deck=str(deck))
+    assert rc == 2                                          # 没审核记录 → 拒绝出片
