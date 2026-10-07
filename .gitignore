@@ -7,3 +7,6 @@ __pycache__/
 local.json
 *.local.json
 .env
+
+# 审核台保存时留的备份
+*.bak
