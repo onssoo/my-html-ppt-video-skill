@@ -2603,7 +2603,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                 s = sl[b["n"] - 1]
                 grounded = grounding(out, tdir, s)
                 iss = lint(t, b["lo"], grounded, disc=s.get("disc", False))
-                if n > b["hi"] * OVER_TOL:
+                if b.get("hi") and n > b["hi"] * OVER_TOL:      # 单版本没有上限（hi=None）
                     iss.append(f"字数超出上限（{n} > {b['hi']}）")
             res[str(b["n"])] = {"text": t, "n": n, "issues": iss}
         return res

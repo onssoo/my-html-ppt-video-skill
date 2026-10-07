@@ -465,3 +465,11 @@ def test_fit_limits_match_measured_capacity():
     assert m.fit_limits(2, 4)[0] == 25
     assert m.fit_limits(4, 3)[1] == 3 and m.fit_limits(4, 4)[1] == 2 and m.fit_limits(4, 6)[1] == 1
     assert len(m.trim_text("一二三四五六七八九十", 5)) <= 5      # 省略号不超上限
+
+
+# ── 单版本（无 --version）时审核台不能因为 hi=None 崩掉（彩排抓到的 bug）──
+def test_narration_of_handles_missing_hi():
+    """budget 的 hi 在单版本模式是 None；narration_of 里的上限判断必须容错。"""
+    import inspect
+    src = inspect.getsource(m.cmd_review_ui)
+    assert 'b.get("hi")' in src, "narration_of 里的上限判断缺少 None 保护"
