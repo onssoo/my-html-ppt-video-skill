@@ -24,6 +24,12 @@
   · HTML：<section class="slide" data-title="…">，用 #/N 深链逐页截图
   · PPTX / PDF：import 一次性渲染成 slides/ 下的 PNG，其余命令只读 slides.json，
     不再关心原始格式（narrate / review / build 三条路径与 HTML 完全相同）
+
+审核点工作文件（三个 gate，都是给人审的、确定性产物，不调 LLM）：
+  python ppt2video.py outline    outline.json              # Gate 1 大纲审定稿 + 预算表
+  python ppt2video.py deck-pdf   deck/index.html           # Gate 2 画面预览 PDF
+  python ppt2video.py review-doc deck/index.html --version v14   # Gate 2 解说词审定稿
+  python ppt2video.py qc         deck/index.html --version v14   # Gate 3 成片质检报告
 """
 import argparse, asyncio, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, time, wave
 import urllib.request
@@ -44,7 +50,13 @@ CPS = 4.5   # 字/秒：每页目标字数 = data-sec × CPS，首次 build 后�
 MIN_SEC = 12        # 版本模式下每页最短时长；低于这个值一页讲不清楚，脚本会建议跳页
 OVER_TOL = 1.2      # 版本模式的上限容忍：超过目标上限 20% 才判"太长"（内容优先，不硬卡上限）
 DISCLAIMER = "以上财务数据为正向情景测算，不构成业绩或收益承诺，实际结果以正式披露为准。"
-DISC_WORDS = r"不构成.{0,6}承诺|情景测算|以正式披露为准"
+# 只认真正的免责句式。**不含 `情景测算`**——那是规范要求的确定性措辞
+# （narration-spec §六：预测类用"按正向情景测算"），把它算进免责会误伤财务页。
+DISC_WORDS = r"不构成.{0,8}(承诺|建议)|以正式披露为准|免责声明|风险提示"
+# 免责语**默认关闭**（owner 2026-10-07）：除非用 --disclaimer 明确要求，
+# deck 不要加免责页，解说词也不得出现任何免责/声明/风险提示类内容。
+DISCLAIMER_ON = False
+NO_DISC_RULE = "本页不要出现任何免责、声明、承诺、风险提示类的语句，也不要写这类内容的变体。"
 OPENERS = ["首先", "其次", "最后", "那么"]   # 只查句首（避免误伤"最后一公里""最后阶段"）
 # 分类禁用词：键是类别（用于报错），值是词表。按子串匹配。
 BANNED = {
@@ -118,14 +130,28 @@ DEFAULTS = {
     "pad_color": "black",         # 留边颜色，可写成与幻灯片底色一致，如 0x0B1F3A
 }
 
-# narrate 默认走 DGX 上的 infersight 网关
-DEFAULT_LLM_BASE = "http://100.89.119.47:9000/v1"
-DEFAULT_LLM_MODEL = "main"
+# LLM / 文档解析端点**不写进仓库**（本仓库是公开的）。
+# 优先级：环境变量 > 本地配置 ~/.config/mhpvs/local.json > 空。
+#   本地配置示例：{"llm_base": "http://your-gateway:9000/v1", "llm_model": "main",
+#                  "docreader": "http://your-docreader:50052"}
+LOCAL_CONF = Path(os.environ.get("MHPVS_CONF", "~/.config/mhpvs/local.json")).expanduser()
+
+
+def local_conf():
+    try:
+        return json.loads(LOCAL_CONF.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+_CONF = local_conf()
+DEFAULT_LLM_BASE = os.environ.get("LLM_BASE_URL") or _CONF.get("llm_base", "")
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL") or _CONF.get("llm_model", "main")
 
 SOURCE_MAX = int(os.environ.get("SOURCE_MAX_CHARS", "60000"))
 
-# 机队共享的文档解析服务（M2）。事实源 ~/router/docs/docreader-m2.md
-DOCREADER = os.environ.get("DOCREADER_URL", "http://100.89.60.63:50052")
+# 文档解析服务（把 docx/pdf 等转文本）。端点同样只放本地配置。
+DOCREADER = os.environ.get("DOCREADER_URL") or _CONF.get("docreader", "")
 
 NARRATE_SYSTEM = """你是正式商务视频的解说撰稿人。解说词由配音朗读，观众是投资人和产业合作方。
 
@@ -259,7 +285,7 @@ def render(deck, out, n, start):
 #   · PDF  ：PyMuPDF 逐页渲染成 PNG + 提取文字（PDF 里没有演讲者备注）
 #   · PPTX ：python-pptx 提取标题/文字/表格/图表数据/演讲者备注；截图走同名 PDF，
 #            没有同名 PDF 时才用 LibreOffice 转（字体与特效可能有差异）
-# 中间文件 slides.json 可以手工编辑 sec（目标秒数）/ disc（是否要免责语）/ notes（讲述要点），
+# 中间文件 slides.json 可以手工编辑 sec（目标秒数）/ disc（是否要免责语，默认关闭）/ notes（讲述要点），
 # 重新导入时会保留这三次改动。
 
 def pdf_pages(pdf, out):
@@ -808,7 +834,7 @@ def cmd_check():
 
 
 def load_source(path):
-    """读源文档。docx/xlsx/pptx/pdf/epub 走机队共享的 docreader（M2 :50052）。"""
+    """读源文档。md/txt 直接读；docx/xlsx/pptx/pdf/epub 走文档解析服务（DOCREADER）。"""
     import urllib.parse
     p = Path(path)
     if not p.exists():
@@ -817,6 +843,11 @@ def load_source(path):
         text = p.read_text(encoding="utf-8")
     else:
         ext = p.suffix.lower().lstrip(".")
+        if not DOCREADER:
+            sys.exit(f"{p.suffix} 需要文档解析服务把文件转成 Markdown，但没配置端点。\n"
+                     f"设 DOCREADER_URL 环境变量，或写进本地配置 {LOCAL_CONF}：\n"
+                     f'  {{"docreader": "http://<你的解析服务>:50052"}}\n'
+                     f"（也可以先把文档手动转成 .md 再喂给本工具）")
         url = (f"{DOCREADER}/read?file_name={urllib.parse.quote(p.name)}"
                f"&file_type={urllib.parse.quote(ext)}")
         req = urllib.request.Request(url, data=p.read_bytes(),
@@ -873,6 +904,9 @@ def relevant(chunks, query, k=4, budget=6000):
 
 def llm(system, user, image=None):
     base = (os.environ.get("LLM_BASE_URL") or DEFAULT_LLM_BASE).rstrip("/")
+    if not base:
+        sys.exit(f"没配置 LLM 端点。设 LLM_BASE_URL 环境变量，或写进本地配置 {LOCAL_CONF}：\n"
+                 f'  {{"llm_base": "http://<你的网关>:9000/v1", "llm_model": "main"}}')
     model = os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
     content = user
     if image:
@@ -951,7 +985,8 @@ def allocate(slides, total, skip=()):
     secs = {p: max(MIN_SEC, s) for p, s in secs.items()}
     got = sum(secs.values())        # 钳制后总长会超标 → 必须报出来，不能静默
     if got > total + 0.5:
-        print(f"⚠ 因每页下限 {MIN_SEC} 秒，实际总长 {got / 60:.1f} 分钟 > 目标 {total / 60:.1f} 分钟")
+        print(f"⚠ 因每页下限 {MIN_SEC} 秒，实际总长 {got / 60:.2f} 分钟"
+              f"（比目标多 {got - total:.0f} 秒）> 目标 {total / 60:.2f} 分钟")
     if not all(slides[i].get("sec") or slides[i].get("fixed") for i in idx):
         print("  （有页面没设权重，按默认 45 平均分配；要差别对待就在 data-sec / slides.json 里设）")
     return secs
@@ -1021,7 +1056,7 @@ def ungrounded_numbers(text, grounded):
 
 
 def lint(text, lo, grounded=None, disc=False):
-    """检查字数下限、问句、套话、画面指代、俚语、绝对化、句子过碎、禁用符号、免责页、数字溯源。
+    """检查字数下限、问句、套话、画面指代、俚语、绝对化、句子过碎、禁用符号、免责语、数字溯源。
     返回问题列表（空 = 合格）。只设字数下限不设上限：信息讲透优先。"""
     issues = []
     n = len(re.sub(r"\s", "", text))
@@ -1041,7 +1076,10 @@ def lint(text, lo, grounded=None, disc=False):
     bad = [c for c in "（）()→—/＃#*[]｜|" if c in text]
     if bad:
         issues.append("出现禁用符号：" + "、".join(sorted(set(bad))))
-    if disc:
+    if not DISCLAIMER_ON:                      # 默认：任何页都不许出现免责/声明类内容
+        if re.search(DISC_WORDS, text):
+            issues.append("出现免责/声明类内容（本流程默认不加，要加请用 --disclaimer）")
+    elif disc:
         if not re.search(DISC_WORDS, text):
             issues.append("缺少免责声明")
     elif re.search(DISC_WORDS, text):
@@ -1055,7 +1093,7 @@ def lint(text, lo, grounded=None, disc=False):
 
 def cmd_narrate(out, slides, v=None, source=None, pages=None, mode="auto", lo=100, hi=180,
                 brief=None, vision=False):
-    """逐页生成解说词。每页独立调用 LLM（system 带本页免责口径），不再整篇一次生成——
+    """逐页生成解说词。每页独立调用 LLM（system 带本页的免责口径：默认关闭、禁止出现），不再整篇一次生成——
     整篇模式会让模型套用"承接→结论→引出"的固定结构，写出电报体碎句。
 
     v 不为 None 时走版本模式：总时长按权重分到每页，再换算成每页字数目标；
@@ -1109,7 +1147,8 @@ def cmd_narrate(out, slides, v=None, source=None, pages=None, mode="auto", lo=10
         else:
             lo_i, hi_i = page_floor(pg["sec"], lo), None
         system = NARRATE_SYSTEM.format(
-            disclaimer=DISCLAIMER if disc else "本页不涉及财务预测，不要说免责语。",
+            disclaimer=((DISCLAIMER if disc else "本页不涉及财务预测，不要说免责语。")
+                        if DISCLAIMER_ON else NO_DISC_RULE),
             brief=brief or "（无场景卡）")
         toc = "\n".join(f"{j}. {'**' + title(t) + '**（本页）' if j == i else title(t)}"
                         for j, t in enumerate(slides, 1))
@@ -1302,10 +1341,704 @@ def cmd_build(out, slides, v=None):
         f"final-{v['name']}.mp4" if v else "final-video.mp4")
 
 
+# ─── 审核点工作文件（三个 gate 的人审产物，全部确定性、不调 LLM）──────
+# Gate 1 大纲 → 大纲审定稿（含时长/字数预算表）
+# Gate 2 画面 + 解说词 → 预览 PDF + 解说词审定稿
+# Gate 3 成片 → 质检报告（时长/逐页偏差/字幕/音量/重录表）
+
+def cmd_outline(path, out_path=None):
+    """Gate 1：把 outline.json 渲染成可审的大纲审定稿，并给出每页时长与字数预算。"""
+    oj = Path(path)
+    if not oj.exists():
+        sys.exit(f"没有 {oj}")
+    try:
+        o = json.loads(oj.read_text(encoding="utf-8"))
+    except Exception as e:
+        sys.exit(f"outline.json 解析失败：{e}")
+    pages = o.get("pages") or []
+    if not pages:
+        sys.exit("outline.json 里没有 pages")
+    try:
+        minutes = float(o.get("minutes") or 0)
+    except (TypeError, ValueError):
+        sys.exit("outline.json 的 minutes 不是数字")
+    if not minutes:
+        sys.exit("outline.json 缺 minutes（目标总时长）")
+    # 借用版本模式的同一套分配逻辑：weight → sec 权重，fixed → 固定秒数
+    fake = [{"title": p.get("title", ""), "sec": p.get("weight"), "fixed": p.get("fixed"),
+             "disc": bool(p.get("disc")), "text": p.get("points", []), "notes": p.get("notes", [])}
+            for p in pages]
+    secs = allocate(fake, minutes * 60)
+    cps = float(os.environ.get("CPS", "4.5"))
+    L = [f"# {o.get('project', '（未命名）')} · 大纲审定稿", ""]
+    if o.get("goal"):
+        L += [f"**这份 PPT 要让人得到的判断**：{o['goal']}", ""]
+    L += [f"- 目标 **{minutes:g} 分钟** · {len(pages)} 页 · 受众：{o.get('audience', '—')} · 风格：{o.get('style', '—')}",
+          f"- 源文档：{o.get('source', '—')}",
+          f"- **怎么改**：改 `{oj.name}`，或用 `review-ui` 打开审核台逐页改（推荐）。",
+          f"- 权重是**相对权重**（大的页分到更多时间）；固定秒数不参与缩放；字数目标由 `allocate`/`chars_for` 算出。", ""]
+    # 按章分组
+    order, groups = [], {}
+    for i, p in enumerate(pages, 1):
+        c = p.get("chapter") or "（未分章）"
+        if c not in groups:
+            groups[c] = []
+            order.append(c)
+        groups[c].append(i)
+    for c in order:
+        ids = groups[c]
+        sub = sum(secs[i] for i in ids)
+        L += ["", f"## {c}　（{len(ids)} 页 · {sub / 60:.1f} 分钟）", "",
+              "| 页 | 标题 | 权重 | 固定 | 时长 | 目标字数 |", "|---|---|---|---|---|---|"]
+        for i in ids:
+            p, cc = pages[i - 1], chars_for(secs[i], cps)
+            L.append(f"| {i} | {p.get('title', '')} | {p.get('weight') or ''} | {p.get('fixed') or ''} | "
+                     f"{'✓' if p.get('disc') else ''} | {secs[i]:.0f}s | {int(cc * 0.9)}–{int(cc * 1.1)} |")
+        L += [""]
+        for i in ids:
+            p = pages[i - 1]
+            L += [f"### 第 {i} 页 · {p.get('title', '')}", ""]
+            if p.get("point"):
+                L += [f"**核心观点**：{p['point']}", ""]
+            if p.get("support"):
+                L += ["**支撑材料**", ""] + [f"- {x}" for x in p["support"]] + [""]
+            if p.get("layout"):
+                L += [f"**呈现方式**：{p['layout']}", ""]
+            if p.get("dropped"):
+                L += [f"**取舍**：{p['dropped']}", ""]
+            if p.get("notes"):
+                L += ["**讲述要点（降序）**", ""] + [f"{k}. {x}" for k, x in enumerate(p["notes"], 1)] + [""]
+    tot = sum(chars_for(s, cps) for s in secs.values())
+    L += ["", "---", "", f"合计目标字数 **{tot}** ≈ {tot / cps / 60:.1f} 分钟纯语音"
+                       f"（差额是页首尾留白与句间停顿，成片约 {minutes:g} 分钟）"]
+    dest = Path(out_path) if out_path else oj.with_name("大纲-审定.md")
+    dest.write_text("\n".join(L), encoding="utf-8")
+    print(f"已写入 {dest}：{len(pages)} 页 · 目标 {minutes:g} 分钟 · 合计约 {tot} 字")
+
+
+def cmd_deck_pdf(deck, out_path=None):
+    """Gate 2：把 out/slides/*.png 拼成一份 PDF——像 PPT 一样翻着审。"""
+    from PIL import Image
+    out = Path(deck).resolve().parent / "video-output"
+    ps = sorted((out / "slides").glob("*.png"))
+    if not ps:
+        sys.exit("还没有截图，先跑 review")
+    imgs = [Image.open(p).convert("RGB") for p in ps]
+    dest = Path(out_path) if out_path else Path(deck).resolve().parent / f"{Path(deck).stem}-预览.pdf"
+    imgs[0].save(dest, save_all=True, append_images=imgs[1:], resolution=120)
+    print(f"已写入 {dest}：{len(imgs)} 页（{dest.stat().st_size // 1024} KB）")
+
+
+def cmd_review_doc(deck, out, v=None, out_path=None):
+    """Gate 2：逐页解说词审定稿——画面要点 / 讲述要点（降序）/ 解说词 / 字数 vs 目标 / lint。
+    lint 只卡下限，版本模式下上限就是时长控制本身，所以这里按 narrate 的同一容忍度补一条上限检查。"""
+    tdir = v["dir"] if v else Path(out)
+    slides = load_slides(deck, out)
+    cps = load_cps(out)
+    secs = allocate(slides, v["minutes"] * 60, v["skip"]) if v else None
+    nj = tdir / "narrations.json"
+    if not nj.exists():
+        sys.exit(f"还没有解说词：{nj}")
+    narr = json.loads(nj.read_text(encoding="utf-8"))
+    iters = sorted(secs, key=int) if secs else range(1, len(slides) + 1)
+    rows = ["| 页 | 标题 | 时长 | 目标字数 | 实际 | lint |", "|---|---|---|---|---|---|"]
+    blocks, tot, tot_t, nbad = [], 0, 0, 0
+    for i in iters:
+        i = int(i)
+        s = slides[i - 1]
+        lo = hi = None
+        if secs:
+            c = chars_for(secs[i], cps); lo, hi = int(c * 0.9), int(c * 1.1)
+        else:
+            lo = page_floor(s["sec"], 100)
+        txt = narr.get(str(i), "").strip()
+        n = len(re.sub(r"\s", "", txt))
+        grounded = "\n".join([s["title"], *s["text"], *s["notes"]])
+        iss = lint(txt, lo, grounded, disc=s.get("disc", False))
+        if hi and n > hi * OVER_TOL:
+            iss.append(f"字数超出上限（{n} > {hi}）")
+        nbad += bool(iss)
+        tot += n
+        rng = f"{lo}–{hi}" if hi else f"≥{lo}"
+        tot_t += c if secs else lo                     # 用区间中值做"目标"，上限只是容忍边界
+        rows.append(f"| {i} | {s['title']} | {secs[i]:.0f}s | {rng} | {n} | "
+                    f"{'✔' if not iss else '✘ ' + '；'.join(iss)} |" if secs else
+                    f"| {i} | {s['title']} | — | {rng} | {n} | {'✔' if not iss else '✘ ' + '；'.join(iss)} |")
+        tog = len(re.sub(r"\s", "", "\n".join(s["text"])))
+        b = ["---", "", f"## 第 {i} 页 · {s['title']}",
+             (f"`{secs[i]:.1f}s` · " if secs else "")
+             + f"字数目标 **{rng}** · 实际 **{n}**"
+             + (" · `data-disclaimer`" if s.get("disc") else "")
+             + (" · `data-fixed`" if s.get("fixed") else ""), "",
+             f"**画面（{tog} 字）**：{' / '.join(s['text'])[:300]}", ""]
+        if s["notes"]:
+            b += ["**讲述要点（降序）**", ""] + [f"{k}. {x}" for k, x in enumerate(s["notes"], 1)] + [""]
+        b += ["**解说词**", "", "> " + txt.replace("\n", "\n> "), ""]
+        if iss:
+            b += [f"⚠️ lint：{'；'.join(iss)}", ""]
+        blocks += b
+    L = [f"# {Path(deck).stem} · 解说词审定稿（{v['name'] if v else '单版本'}）", "",
+         (f"- 目标时长 **{v['minutes']} 分钟** · " if v else "")
+         + f"{len(list(iters))} 页 · 假定语速 {cps} 字/秒",
+         f"- 合计 **{tot} 字**" + (f" / 目标 {tot_t}" if v else "")
+         + (f" · **lint 未过 {nbad} 页**" if nbad else " · lint 全绿"),
+         "- **怎么改**：直接改本文件的「解说词」段落并告诉我，或改 narrations.json 后重跑本命令。", "",
+         *rows, ""]
+    dest = Path(out_path) if out_path else Path(deck).resolve().parent / f"解说词审定稿-{v['name'] if v else 'default'}.md"
+    dest.write_text("\n".join(L + blocks), encoding="utf-8")
+    print(f"已写入 {dest}：{tot} 字" + (f" / 目标 {tot_t}" if v else "")
+          + (f"，lint 未过 {nbad} 页" if nbad else "，lint 全绿"))
+
+
+def cmd_qc(deck, out, v=None, out_path=None):
+    """Gate 3：质检报告。不依赖 ffprobe——时长读 narration.wav，逐页时长读 list.ffconcat。"""
+    tdir = v["dir"] if v else Path(out)
+    ffc = tdir / "list.ffconcat"
+    wav = tdir / "narration.wav"
+    if not ffc.exists() or not wav.exists():
+        sys.exit(f"先出片（缺 {ffc.name} / {wav.name}）")
+    slides = load_slides(deck, out)
+    secs = allocate(slides, v["minutes"] * 60, v["skip"]) if v else None
+    with wave.open(str(wav)) as w:
+        total = w.getnframes() / w.getframerate()
+        a = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768
+    peak, rms = float(np.abs(a).max()), float(np.sqrt((a ** 2).mean()))
+    # 逐页时长：从 ffconcat 里取 duration（图片行与 duration 行成对）
+    durs, cur = {}, None
+    for line in ffc.read_text(encoding="utf-8").splitlines():
+        m1 = re.search(r"file '.*?(\d{3})\.png'", line)
+        m2 = re.search(r"^duration ([\d.]+)", line)
+        if m1:
+            cur = int(m1.group(1))
+        elif m2 and cur:
+            durs[cur] = durs.get(cur, 0) + float(m2.group(1))
+            cur = None
+    target = sum(chars_for(secs[i], load_cps(out)) for i in secs) if secs else 0
+    L = [f"# {Path(deck).stem} · 成片质检报告（{v['name'] if v else '单版本'}）", "",
+         f"- 实际总时长 **{total / 60:.2f} 分钟**（{total:.1f} 秒）"
+         + (f" · 目标 {v['minutes']} 分钟 · 偏差 **{total / (v['minutes'] * 60) - 1:+.0%}**" if v else ""),
+         f"- 音量：峰值 **{peak:.3f}**（{20 * np.log10(max(peak, 1e-6)):.1f} dBFS）· RMS {rms:.4f}"
+         + ("  ⚠ 偏低，检查配音" if peak < 0.05 else "  ✔ 正常"),
+         f"- 页数：{len(durs)} 页有音轨", "",
+         "| 页 | 标题 | 目标 | 实际 | 偏差 | 重录 |", "|---|---|---|---|---|---|"]
+    bad = []
+    for i in sorted(durs):
+        s = slides[i - 1]
+        tgt = secs.get(i) if secs else s.get("sec")
+        d = durs[i]
+        dev = f"{d / tgt - 1:+.0%}" if tgt else "—"
+        if tgt and d / tgt < 0.8:
+            bad.append(i)
+        L.append(f"| {i} | {s['title']} | {f'{tgt:.0f}s' if tgt else '—'} | {d:.1f}s | {dev} | [ ] |")
+    L += ["", f"**逐页时长明显偏短（< 80% 目标）**：{bad or '无'}", "",
+          "## 字幕抽样", ""]
+    srt = (tdir / "subs.srt").read_text(encoding="utf-8") if (tdir / "subs.srt").exists() else ""
+    cues = re.findall(r"\d+\n([\d:,]+) --> ([\d:,]+)\n(.+?)\n", srt)
+    L += [f"- 共 **{len(cues)}** 条字幕", ""]
+    sample = cues if len(cues) <= 6 else cues[:3] + cues[-2:]   # 短字幕表别重复抽首尾
+    for a_, b_, c_ in sample:
+        L += [f"- `{a_}` → `{b_}`  {c_}", ""]
+    L += ["## 重录", "",
+          "在上面表格的「重录」列打 `[x]`，或直接告诉我「第 N 页重录，因为……」。"
+          "只重合成被勾的页（句子级缓存会让其余页命中原音频）。", "",
+          "## 怎么复核", "",
+          "- 音色是否一致、有没有念错字：听片子；用 `redo` 表标记问题页。",
+          "- 字幕与语音是否对齐：抽 3 处跳转核对（片头 / 中间 / 片尾）。",
+          f"- 成片文件：`{tdir}/final-{v['name'] if v else 'video'}.mp4`"]
+    dest = Path(out_path) if out_path else tdir / "质检报告.md"
+    dest.write_text("\n".join(L), encoding="utf-8")
+    print(f"已写入 {dest}：实际 {total / 60:.2f} 分钟"
+          + (f" / 目标 {v['minutes']} 分钟" if v else "") + f"，偏短页 {bad or '无'}")
+
+
+# ─── 审核台（review-ui）：本机起服务，只读展示 + 白名单写回 ──────────
+# 由 skill 在到达审核点时按需拉起，前台阻塞到 owner 点「完成」为止。
+# 它不做创作、不跑 pipeline：只把三个 gate 的产物渲染成可审界面，
+# 并把 owner 的改动写回真源文件（outline.json / narrations.json / redo.json）。
+
+def _ffconcat_durs(ffc):
+    """从 list.ffconcat 里取每页时长（图片行 + duration 行成对）。不依赖 ffprobe。"""
+    durs, cur = {}, None
+    for line in Path(ffc).read_text(encoding="utf-8").splitlines():
+        m1 = re.search(r"file '.*?(\d{3})\.(?:png|jpg|jpeg)'", line)
+        m2 = re.match(r"duration ([\d.]+)", line)
+        if m1:
+            cur = int(m1.group(1))
+        elif m2 and cur:
+            durs[cur] = durs.get(cur, 0.0) + float(m2.group(1))
+            cur = None
+    return durs
+
+
+def _wav_stats(wav):
+    """音轨总时长 / 峰值 / RMS。用 wave 读，不需要 ffprobe。"""
+    with wave.open(str(wav)) as w:
+        total = w.getnframes() / w.getframerate()
+        a = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768
+    return total, float(np.abs(a).max()), float(np.sqrt((a ** 2).mean()))
+
+
+def _outline_budget(o, cps=None):
+    """outline.json → 每页分配秒数与字数区间（与出片时同一套 allocate/chars_for）。"""
+    cps = cps or float(os.environ.get("CPS", "4.5"))
+    fake = [{"title": p.get("title", ""), "sec": p.get("weight"), "fixed": p.get("fixed"),
+             "disc": bool(p.get("disc")), "text": p.get("points", []), "notes": p.get("notes", [])}
+            for p in o.get("pages", [])]
+    secs = allocate(fake, float(o.get("minutes") or 14) * 60)
+    out = []
+    for i, p in enumerate(o.get("pages", []), 1):
+        c = chars_for(secs[i], cps)
+        out.append({"n": i, "title": p.get("title", ""), "kind": p.get("kind", ""),
+                    "weight": p.get("weight"), "fixed": p.get("fixed"), "disc": bool(p.get("disc")),
+                    "sec": round(secs[i], 1), "lo": int(c * 0.9), "hi": int(c * 1.1)})
+    return out, cps
+
+
+# ─── 大纲.md（Gate 1 的真源：导演剧本，模型据此做 slides）─────────────
+# md 是人写的、也是模型读的；工具只从里面抠它需要的几个数（页号/页长），
+# 其余内容原样保留。审核台把它按页拆开显示，保存时把那一段原样写回。
+
+OUTLINE_MD = "大纲.md"
+
+
+def parse_outline_md(text):
+    """拆成 前言 / 各部分 / 每页（每页保留原始 md 片段，便于原样写回）。"""
+    lines = text.split("\n")
+    parts, pages, pre, i, n = [], [], [], 0, len(text.split("\n"))
+    while i < n:
+        ln = lines[i]
+        mp = re.match(r"^##\s+第\s*(\d+)\s*部分\s*[·:：]\s*(.+?)\s*$", ln)
+        if mp:
+            role, k = "", i + 1
+            while k < n and not lines[k].strip():       # 跨过空行再找「这部分干什么」
+                k += 1
+            if k < n:
+                r = re.match(r"^>\s*这部分干什么\s*[：:]\s*(.+)$", lines[k].strip())
+                if r:
+                    role = r.group(1).strip()
+            parts.append({"idx": int(mp.group(1)), "name": mp.group(2).strip(), "role": role, "pages": []})
+            i += 1
+            continue
+        mg = re.match(r"^###\s+第\s*(\d+)\s*页\s*[·:：]\s*(.+?)\s*$", ln)
+        if mg:
+            j = i + 1
+            while j < n and not re.match(r"^###\s+第\s*\d+\s*页", lines[j]) \
+                    and not re.match(r"^##\s+第\s*\d+\s*部分", lines[j]):
+                j += 1
+            chunk = "\n".join(lines[i:j]).rstrip()
+            num, title = int(mg.group(1)), mg.group(2).strip()
+            w = re.search(r"\*\*页长\*\*\s*[：:]\s*权重\s*(\d+)", chunk)
+            f = re.search(r"\*\*页长\*\*\s*[：:]\s*固定\s*(\d+)\s*秒", chunk)
+            d = re.search(r"\*\*免责\*\*\s*[：:]\s*(是|否)", chunk)
+            pages.append({"n": num, "title": title, "chunk": chunk, "part": parts[-1]["name"] if parts else "",
+                          "weight": int(w.group(1)) if w else None,
+                          "fixed": int(f.group(1)) if f else None,
+                          "disc": bool(d and d.group(1) == "是")})
+            if parts:
+                parts[-1]["pages"].append(num)
+            i = j
+            continue
+        if not parts and not pages:
+            pre.append(ln)
+        i += 1
+    return {"preamble": "\n".join(pre).rstrip(), "parts": parts, "pages": pages}
+
+
+def replace_page_md(text, n, chunk):
+    """把第 n 页那一段替换掉，其他字节不动。n=0 表示文件头部（前言）。"""
+    lines, i, N = text.split("\n"), 0, len(text.split("\n"))
+    if n == 0:
+        for i, ln in enumerate(lines):
+            if re.match(r"^##\s+第\s*\d+\s*部分", ln):
+                return "\n".join(chunk.split("\n") + lines[i:])
+        return chunk
+    while i < N:
+        mg = re.match(r"^###\s+第\s*(\d+)\s*页\s*[·:：]", lines[i])
+        if mg and int(mg.group(1)) == n:
+            j = i + 1
+            while j < N and not re.match(r"^###\s+第\s*\d+\s*页", lines[j]) \
+                    and not re.match(r"^##\s+第\s*\d+\s*部分", lines[j]):
+                j += 1
+            return "\n".join(lines[:i] + chunk.split("\n") + lines[j:])
+        i += 1
+    return None
+
+
+def outline_md_budget(parsed, cps=None):
+    """大纲.md 的每页 → 分配秒数与字数区间（与出片同一套 allocate/chars_for）。"""
+    cps = cps or float(os.environ.get("CPS", "4.5"))
+    minutes = float(os.environ.get("OUTLINE_MINUTES", "14"))
+    m = re.search(r"目标时长\s*[：:]\s*([\d.]+)\s*分钟", parsed["preamble"])
+    if m:
+        minutes = float(m.group(1))
+    # 大纲阶段通常不写权重（时长是后面解说词阶段的事）：没权重的页按等权处理，别刷告警
+    fake = [{"title": p["title"], "sec": None if p["fixed"] else (p["weight"] or 45),
+             "fixed": p["fixed"], "disc": p["disc"], "text": [], "notes": []} for p in parsed["pages"]]
+    secs = allocate(fake, minutes * 60)
+    out = []
+    for p in parsed["pages"]:
+        c = chars_for(secs[p["n"]], cps)
+        out.append({"n": p["n"], "title": p["title"], "kind": p["part"], "weight": p["weight"],
+                    "fixed": p["fixed"], "disc": p["disc"], "sec": round(secs[p["n"]], 1),
+                    "lo": int(c * 0.9), "hi": int(c * 1.1)})
+    return out, cps, minutes
+
+
+def renumber_outline_md(text):
+    """按文档顺序把 `### 第 NN 页 ·` 重编成 1..N（页号只是序号标签）。"""
+    out, n = [], 0
+    for ln in text.split("\n"):
+        mo = re.match(r"^### 第\s*\d+\s*页\s*[·:：]\s*(.+)$", ln)
+        if mo:
+            n += 1
+            out.append(f"### 第 {n:02d} 页 · {mo.group(1)}")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _page_span(lines, n):
+    """第 n 页在行数组里的 [起, 止) —— 到下一个 ### 页 或 ## 第 N 部分 为止。
+    注意：md 里的页号是补零的（`第 02 页`），所以要用 0* 吃掉前导零。"""
+    s = next((i for i, l in enumerate(lines)
+              if re.match(rf"^###\s+第\s*0*{n}\s*页\s*[·:：]", l)), None)
+    if s is None:
+        return None
+    e = s + 1
+    while e < len(lines) and not re.match(r"^###\s+第\s*\d+\s*页", lines[e]) \
+            and not re.match(r"^##\s+第\s*\d+\s*部分", lines[e]):
+        e += 1
+    return s, e
+
+
+def outline_md_op(text, op, n=0):
+    """大纲结构操作：add（在第 n 页后加一页）/ del / up / down。返回新文本；不可行返回 None。"""
+    p = parse_outline_md(text)
+    nums = [x["n"] for x in p["pages"]]
+    if n not in nums and op != "add":
+        return None
+    lines = text.split("\n")
+    if op == "del":
+        s, e = _page_span(lines, n)
+        return renumber_outline_md("\n".join(lines[:s] + lines[e:]))
+    if op in ("up", "down"):
+        i = nums.index(n)
+        j = i - 1 if op == "up" else i + 1
+        if j < 0 or j >= len(nums):
+            return None
+        a, b = _page_span(lines, nums[i]), _page_span(lines, nums[j])
+        (s1, e1), (s2, e2) = (a, b) if a[0] < b[0] else (b, a)
+        blk1, blk2 = lines[s1:e1], lines[s2:e2]
+        return renumber_outline_md("\n".join(lines[:s1] + blk2 + blk1 + lines[e2:]))
+    if op == "add":
+        stub = ("### 第 00 页 · 新页\n"
+                "- **骨架**：`bullets.html`（信息点上限 6）\n"
+                "- **这页干什么**：\n"
+                "- **页面文字**：kicker `` ｜ 标题 `` ｜ 副标题 ``\n"
+                "- **信息点**：\n  1. \n"
+                "- **数据/数字**：\n"
+                "- **演讲备注**：\n  1. \n"
+                "- **舍弃**：\n")
+        if n in nums:                                   # 插在这一页后面（同属一个部分）
+            s, e = _page_span(lines, n)
+            return renumber_outline_md("\n".join(lines[:e] + stub.split("\n") + lines[e:]))
+        return renumber_outline_md(text.rstrip() + "\n\n" + stub)   # 没有 n 就追加到末尾
+    return None
+
+
+def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, open_browser=True):
+    import http.server, mimetypes, socket, threading, urllib.parse, webbrowser
+
+    tgt = Path(target).resolve()
+    if not tgt.exists():
+        sys.exit(f"没有 {tgt}")
+    is_deck = tgt.suffix.lower() in (".html", ".htm")
+    deck = str(tgt) if is_deck else (tgt.parent / "index.html" if (tgt.parent / "index.html").exists() else None)
+    work = tgt.parent
+    oj = (work / "outline.json") if not is_deck else ((work.parent / "outline.json") if (work.parent / "outline.json").exists() else (work / "outline.json"))
+    out = Path(deck).parent / "video-output" if deck else work / "video-output"
+    v = load_version(deck, out, version) if (version and deck) else None
+    tdir = v["dir"] if v else out
+    roots = [work, work.parent, out, tdir]
+    tpl = Path(__file__).resolve().parent / "review-ui.html"
+    if not tpl.exists():
+        sys.exit(f"缺界面文件 {tpl}")
+
+    def slides_of():
+        if not deck:
+            return []
+        try:
+            sl = load_slides(deck, out)
+        except SystemExit:
+            return []
+        ps = sorted((out / "slides").glob("*.png"))
+        res = []
+        for i, p in enumerate(ps, 1):
+            res.append({"n": i, "url": "/file?p=" + urllib.parse.quote(str(p)),
+                        "title": sl[i - 1]["title"] if i - 1 < len(sl) else ""})
+        return res
+
+    def narration_of(budget):
+        nj = tdir / "narrations.json"
+        if not nj.exists():
+            return None
+        narr = json.loads(nj.read_text(encoding="utf-8"))
+        sl = load_slides(deck, out) if deck else []
+        cps = float(os.environ.get("CPS", "4.5"))
+        res = {}
+        for b in budget:
+            t = (narr.get(str(b["n"])) or "").strip()
+            n = len(re.sub(r"\s", "", t))
+            iss = []
+            if deck and b["n"] - 1 < len(sl):
+                s = sl[b["n"] - 1]
+                grounded = "\n".join([s["title"], *s["text"], *s["notes"]])
+                iss = lint(t, b["lo"], grounded, disc=s.get("disc", False))
+                if n > b["hi"] * OVER_TOL:
+                    iss.append(f"字数超出上限（{n} > {b['hi']}）")
+            res[str(b["n"])] = {"text": t, "n": n, "issues": iss}
+        return res
+
+    def video_of(budget):
+        if not deck:
+            return None
+        cand = sorted(tdir.glob("final-*.mp4")) or sorted(tdir.glob("final-video.mp4"))
+        if not cand or not (tdir / "narration.wav").exists():
+            return None
+        total, peak, rms = _wav_stats(tdir / "narration.wav")
+        durs = _ffconcat_durs(tdir / "list.ffconcat") if (tdir / "list.ffconcat").exists() else {}
+        sl = load_slides(deck, out)
+        pages = []
+        for b in budget:
+            tgt_s = b["sec"]
+            act = durs.get(b["n"])
+            dev = f"{act / tgt_s - 1:+.0%}" if (act and tgt_s) else "—"
+            pages.append({"n": b["n"], "title": b["title"], "target": f"{tgt_s:.0f}s",
+                          "actual": f"{act:.1f}s" if act else "—", "dev": dev,
+                          "short": bool(act and tgt_s and act / tgt_s < 0.8)})
+        return {"url": "/file?p=" + urllib.parse.quote(str(cand[0])), "minutes": f"{total / 60:.2f} 分钟",
+                "target": f"{v['minutes']} 分钟" if v else None,
+                "dev": f"{total / (v['minutes'] * 60) - 1:+.0%}" if v else None,
+                "peak": f"{20 * np.log10(max(peak, 1e-6)):.1f} dBFS", "pages": pages}
+
+    state = {}
+    omd = next((c for c in (work / OUTLINE_MD, work.parent / OUTLINE_MD) if c.exists()), None)
+
+    def build_state():
+        o, parsed = None, None
+        if omd is not None:
+            parsed = parse_outline_md(omd.read_text(encoding="utf-8"))
+        if oj.exists():
+            try:
+                o = json.loads(oj.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"⚠ outline.json 解析失败：{e}")
+        if parsed and parsed["pages"]:
+            budget, cps, mins = outline_md_budget(parsed)
+        else:
+            parsed = None
+            budget, cps = _outline_budget(o) if o else ([], 4.5)
+            mins = (o or {}).get("minutes")
+        if not budget and deck:
+            sl = load_slides(deck, out)
+            secs = allocate(sl, v["minutes"] * 60, v["skip"]) if v else {}
+            budget = [{"n": i + 1, "title": s["title"], "kind": "", "weight": s["sec"],
+                       "fixed": s["fixed"], "disc": s["disc"], "sec": round(secs.get(i + 1, 0), 1),
+                       "lo": int(chars_for(secs.get(i + 1, 0), cps) * 0.9),
+                       "hi": int(chars_for(secs.get(i + 1, 0), cps) * 1.1)} for i, s in enumerate(sl)]
+        state.clear()
+        state.update({
+            "name": Path(deck).stem if deck else tgt.stem, "target": str(tgt), "version": version,
+            "bind": f"{host}:{port}", "outline": o, "outline_md": parsed,
+            "outline_md_text": omd.read_text(encoding="utf-8") if omd else None,
+            "outline_md_path": str(omd) if omd else None, "minutes": mins, "budget": budget,
+            "slides": slides_of(), "narration": narration_of(budget),
+            "video": video_of(budget), "ground": _ground_of(deck, out),
+            "redo": json.loads((tdir / "redo.json").read_text(encoding="utf-8")) if (tdir / "redo.json").exists() else {},
+            "cps": cps,
+        })
+        return state
+
+    def _ground_of(deck, out):
+        if not deck:
+            return {}
+        sl = load_slides(deck, out)
+        return {str(i + 1): " / ".join(s["text"])[:400] for i, s in enumerate(sl)}
+
+    changes = []
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a):
+            pass
+        def _send(self, code, body=b"", ctype="application/json; charset=utf-8"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/":
+                return self._send(200, tpl.read_bytes(), "text/html; charset=utf-8")   # 每次读，改界面不用重启
+            if u.path == "/state":
+                return self._send(200, json.dumps(build_state(), ensure_ascii=False).encode())
+            if u.path == "/file":
+                q = urllib.parse.parse_qs(u.query).get("p", [""])[0]
+                p = Path(q).resolve()
+                if not any(str(p).startswith(str(r)) for r in roots) or not p.is_file():
+                    return self._send(403, b'{"error":"forbidden"}')
+                ctype = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+                size = p.stat().st_size
+                rng = self.headers.get("Range") or ""
+                start, end, code = 0, size - 1, 200
+                m = re.match(r"bytes=(\d*)-(\d*)", rng)
+                if m and (m.group(1) or m.group(2)):
+                    if m.group(1):
+                        start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                    code = 206
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(end - start + 1))
+                if code == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                with open(p, "rb") as f:
+                    f.seek(start)
+                    self.wfile.write(f.read(end - start + 1))
+                return
+            self._send(404, b'{"error":"not found"}')
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                req = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, b'{"error":"bad json"}')
+            g = "done" if path == "/done" else req.get("gate")     # /done 按路径认，不靠 body
+            if g == "outline-md":                  # 大纲.md 写回（md 是真源）
+                if omd is None:
+                    return self._send(400, b'{"error":"no outline.md"}')
+                txt = omd.read_text(encoding="utf-8")
+                if req.get("full") is not None:    # 整篇替换（自由改页数/标题/顺序）
+                    new = renumber_outline_md(req["full"].rstrip() + "\n")
+                    if not parse_outline_md(new)["pages"]:
+                        return self._send(400, json.dumps({"error": "改完解析不出任何页，检查 '### 第 NN 页 · 标题' 格式"}).encode())
+                    txt = new
+                    changes.append("大纲.md：整篇改写")
+                elif req.get("op"):                # 结构操作：add / del / up / down
+                    new = outline_md_op(txt, req["op"], int(req.get("n") or 0))
+                    if new is None:
+                        return self._send(400, json.dumps({"error": f"操作 {req['op']} 于第 {req.get('n')} 页不可行"}).encode())
+                    txt = new
+                    changes.append(f"大纲.md：{req['op']} 第 {req.get('n')} 页")
+                else:                              # 逐页写回
+                    pages = req.get("pages") or ({str(req["n"]): req.get("chunk", "")} if "n" in req else None)
+                    if not pages:
+                        return self._send(400, b'{"error":"nothing to save"}')
+                    for k, chunk in pages.items():
+                        new = replace_page_md(txt, int(k), (chunk or "").rstrip())
+                        if new is None:
+                            return self._send(400, json.dumps({"error": f"page {k} not found"}).encode())
+                        txt = new
+                    changes.append(f"大纲.md：改了 {len(pages)} 处")
+                shutil.copy2(omd, omd.with_name(omd.name + ".bak"))
+                omd.write_text(txt, encoding="utf-8")
+                st = build_state()
+                return self._send(200, json.dumps(st, ensure_ascii=False).encode())
+            if g == "outline":
+                o = req.get("outline") or {}
+                if not o.get("pages"):
+                    return self._send(400, b'{"error":"pages \xe4\xb8\x8d\xe8\x83\xbd\xe4\xb8\xba\xe7\xa9\xba"}')
+                if oj.exists():                       # 留一份上一版，误保存可回退
+                    shutil.copy2(oj, oj.with_suffix(".json.bak"))
+                oj.write_text(json.dumps(o, ensure_ascii=False, indent=2), encoding="utf-8")
+                changes.append(f"大纲：{len(o['pages'])} 页 / 目标 {o.get('minutes')} 分钟")
+                st = build_state()
+                return self._send(200, json.dumps(st, ensure_ascii=False).encode())
+            if g == "narration":
+                nj = tdir / "narrations.json"
+                narr = json.loads(nj.read_text(encoding="utf-8")) if nj.exists() else {}
+                i = int(req["n"])
+                txt = (req.get("text") or "").strip()
+                old = len(re.sub(r"\s", "", narr.get(str(i), "")))
+                narr[str(i)] = txt
+                nj.write_text(json.dumps(dict(sorted(narr.items(), key=lambda kv: int(kv[0]))),
+                                         ensure_ascii=False, indent=2), encoding="utf-8")
+                changes.append(f"解说词第 {i} 页：{old} → {len(re.sub(r'\\s', '', txt))} 字")
+                st = build_state()
+                return self._send(200, json.dumps(st, ensure_ascii=False).encode())
+            if g == "redo":
+                (tdir / "redo.json").write_text(
+                    json.dumps(req.get("redo") or {}, ensure_ascii=False, indent=2), encoding="utf-8")
+                changes.append(f"重录标记：{len(req.get('redo') or {})} 页")
+                return self._send(200, b'{"ok":true}')
+            if g == "done":
+                log = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "target": str(tgt),
+                       "version": version, "changes": changes}
+                (work / "review-log.json").write_text(json.dumps(log, ensure_ascii=False, indent=2),
+                                                      encoding="utf-8")
+                self._send(200, json.dumps({"ok": True, "summary": "；".join(changes) or "没有改动"},
+                                           ensure_ascii=False).encode())
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            self._send(400, b'{"error":"unknown gate"}')
+
+    class Srv(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+    for p in range(port, port + 20):
+        try:
+            httpd = Srv((host, p), H)
+            port = p
+            break
+        except OSError:
+            continue
+    else:
+        sys.exit(f"{host}:{port}~{port + 19} 都被占用")
+    ips = ["127.0.0.1"]
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.append(info[4][0])
+    except Exception:
+        pass
+    urls = [f"http://{i}:{port}/" for i in dict.fromkeys(ips)]
+    print("审核台已启动：")
+    for u in urls:
+        print("   " + u)
+    print(f"   数据：{tgt}\n   完成审核后服务自动关闭。")
+    if open_browser and host in ("127.0.0.1", "localhost"):
+        try:
+            webbrowser.open(urls[0])
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n（手动中断）")
+    finally:
+        httpd.server_close()
+    lg = work / "review-log.json"
+    if lg.exists():
+        d = json.loads(lg.read_text(encoding="utf-8"))
+        print(f"\n审核结束 {d['at']}：")
+        for c in d["changes"] or ["（没有改动）"]:
+            print("   · " + c)
+
+
 def main():
     ap = argparse.ArgumentParser(description="幻灯片（HTML / PPTX / PDF）→ 配音讲解视频")
-    ap.add_argument("cmd", choices=["check", "import", "narrate", "review", "build"])
-    ap.add_argument("deck", nargs="?", help="幻灯片 HTML / PPTX / PDF 文件")
+    ap.add_argument("cmd", choices=["check", "outline", "import", "narrate", "review",
+                                    "deck-pdf", "review-doc", "qc", "review-ui", "build"])
+    ap.add_argument("deck", nargs="?", help="幻灯片 HTML / PPTX / PDF，或 outline.json")
+    ap.add_argument("--out", help="审核产物的输出路径（大纲审定稿 / 预览 PDF / 审定稿 / 质检报告）")
+    ap.add_argument("--host", default="127.0.0.1", help="review-ui 绑定地址（默认仅本机，可填 tailnet IP）")
+    ap.add_argument("--port", type=int, default=8099, help="review-ui 起始端口（被占用则顺延）")
+    ap.add_argument("--gate", choices=["outline", "deck", "narration", "video"],
+                    help="review-ui 先打开哪个 tab")
+    ap.add_argument("--no-open", action="store_true", help="review-ui 不自动开浏览器")
     ap.add_argument("--reset", action="store_true", help="review 时重新生成 review.md")
     ap.add_argument("--source", help="源文档（.md/.txt/.docx/.pdf…；非文本走 docreader）")
     ap.add_argument("--brief", help="场景卡 md（受众/用途/语气/主线），供解说定调")
@@ -1317,11 +2050,24 @@ def main():
                     help="【单版本模式】无 data-sec 的页用此字数下限（有 data-sec 时按 时长×CPS 推算）；"
                          "用 --version 时不生效，字数由版本总时长分配")
     ap.add_argument("--version", help="versions.json 里的版本名（如 investor-10）；不传则走单版本流程")
+    ap.add_argument("--disclaimer", action="store_true",
+                    help="启用免责语。默认关闭：deck 与解说词都不自动出现免责/声明/风险提示内容")
     ap.add_argument("--hash-start", type=int, default=1,
                     help="翻页 hash 起始编号（html-ppt 为 1，reveal.js 为 0；仅 HTML 用）")
     a = ap.parse_args()
+    global DISCLAIMER_ON
+    if getattr(a, "disclaimer", False):
+        DISCLAIMER_ON = True                   # 只有明确要求才启用免责语
     if a.cmd == "check":
         return cmd_check()
+    if a.cmd == "outline":                     # Gate 1：outline.json → 大纲审定稿
+        if not a.deck:
+            ap.error("outline 需要 outline.json 路径")
+        return cmd_outline(a.deck, a.out)
+    if a.cmd == "review-ui":                   # 审核台：前台阻塞到 owner 点完成
+        if not a.deck:
+            ap.error("review-ui 需要 outline.json 或 deck 路径")
+        return cmd_review_ui(a.deck, a.version, a.host, a.port, a.gate, not a.no_open)
     if not a.deck:
         ap.error("需要指定幻灯片文件（HTML / PPTX / PDF）")
     deck = str(Path(a.deck).resolve())
@@ -1336,6 +2082,12 @@ def main():
             return print("HTML 不需要 import（review 时直接截图）")
         return cmd_import(deck, out)
     v = load_version(deck, out, a.version) if a.version else None
+    if a.cmd == "deck-pdf":                    # Gate 2：画面预览 PDF
+        return cmd_deck_pdf(deck, a.out)
+    if a.cmd == "review-doc":                  # Gate 2：解说词审定稿
+        return cmd_review_doc(deck, out, v, a.out)
+    if a.cmd == "qc":                          # Gate 3：成片质检报告
+        return cmd_qc(deck, out, v, a.out)
     slides = load_slides(deck, out)
     if not slides:
         sys.exit('没找到幻灯片：HTML 需要 <section class="slide">；PPTX/PDF 请确认是幻灯片版式')

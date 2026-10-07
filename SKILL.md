@@ -62,7 +62,7 @@ $PY ~/ppt2video.py build old/融资路演.pptx
 - **PPTX**：python-pptx 提取标题、文字、表格、图表里的数据和**演讲者备注**（备注当"讲述要点"用；
   旧 PPT 的备注常常就是当年的讲稿，是很好的素材）。截图优先用**同名且更新的 PDF**；
   没有才调 LibreOffice 转换。
-- **`slides.json` 可以手工编辑**：每页的 `sec`（目标秒数）、`disc`（是否需要免责说明）、
+- **`slides.json` 可以手工编辑**：每页的 `sec`（目标秒数）、`disc`（是否要免责说明，**默认关闭**）、
   `notes`（讲述要点）都能改。这三项对应 HTML 流程里的 `data-sec`、`data-disclaimer` 和 `notes`，
   解说词规范照样生效。**重新导入时会保留你改过的这三项。**
 - 输出目录：HTML 用 `video-output/`，PPTX/PDF 用 `<文件名>-video/`，同一目录放多份幻灯片不会互相覆盖。
@@ -107,7 +107,9 @@ $PY ~/ppt2video.py build old/融资路演.pptx
 
 **解说词相关属性**：
 - `data-sec="50"`：本页解说词的目标秒数（用于字数下限与"偏短"告警）。
-- `data-disclaimer`：本页是财务预测 / 结论页，解说词**必须**带免责语；其他页**不得**出现。
+- **免责语默认关闭**：deck 不要主动加免责页，解说词也不要写任何免责/声明/风险提示内容（含各种变体）。
+  只有 owner 明确要求时才用 `--disclaimer` 打开；打开后 `data-disclaimer` 才被认作免责页，
+  措辞固定为 `narration-spec.md` 第八节那一句，且只出现在这些页。
 - `<div class="notes">`：本页的讲述要点（解说词的依据，也参与数字溯源）。
 
 ### Phase 1.5: PPT 视觉确认（不可跳过）
@@ -135,11 +137,13 @@ $PY ~/ppt2video.py review deck/index.html
 $PY ~/ppt2video.py narrate deck/index.html --source 原文.md --brief deck/brief.md
 ```
 - **逐页生成**（不再整篇一次）—— 整篇模式会让模型套"承接→结论→引出"的固定结构，写出电报体碎句。
-- 默认走 **DGX 上的 infersight 网关**（`http://100.89.119.47:9000/v1`，模型 `main`，temperature 0.5）。可用 `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` 覆盖。
+- LLM 走 **OpenAI 兼容端点**，temperature 0.5。端点**不写进仓库**，按优先级取：
+  `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` 环境变量 → 本地配置 `~/.config/mhpvs/local.json`
+  （`{"llm_base": "http://<你的网关>:9000/v1", "llm_model": "main"}`）。都没配时命令会直接报错并提示怎么配。
 - `--source`：原始文档，切成块后按相关性喂给每页，做**数字溯源**（解说词里的数字必须能在画面/要点/源文档里找到）。
 - `--brief`：场景卡（brief.md），提供语气、主线、**口径表**（关键数字唯一写法）、术语表。
-- 语气规范见 **`narration-spec.md`**（正式陈述、无自问自答、无套话、无俚语、无画面指代、免责语只在 `data-disclaimer` 页）。
-- 每页过 **lint**（字数下限、问句、套话、碎句、禁用符号、免责语位置、数字溯源），不合格自动重写（最多 2 次）。
+- 语气规范见 **`narration-spec.md`**（正式陈述、无自问自答、无套话、无俚语、无画面指代；**免责默认不加**）。
+- 每页过 **lint**（字数下限、问句、套话、碎句、禁用符号、**免责语（默认出现即不合格）**、数字溯源），不合格自动重写（最多 2 次）。
 - 产出 `narrations.json`，并**自动同步 `review.md`**（保留原配置头），可直接 `build`，无需再跑 `review --reset`。
 
 ### Phase 3: 用户确认（改 review.md）
@@ -169,6 +173,42 @@ $PY ~/ppt2video.py build deck/index.html
 5. **只合成一次音轨、一次视频**（不逐页切片再拼）→ 结构上无累积漂移
 6. `-t <总时长>` 硬截断 → 视频与音轨严格等长
 
+## 三个审核点（Gate 1 / 2 / 3）
+
+每个阶段收尾都要产出**给人审的工作文件**，owner 改完再进下一步。三条命令都是**确定性的**（不调 LLM），随时可重跑。
+
+| Gate | 什么时候 | 命令 | 产物 | owner 能改什么 |
+|---|---|---|---|---|
+| **1 大纲** | 读完源文档、**还没写 deck** 之前 | `outline outline.json` | `大纲-审定.md`：逐页标题/类型/要点/权重 + **时长与字数预算表** | `outline.json`：增删页、调顺序、改权重、改总时长、改受众与风格 |
+| **2 画面 + 解说词** | deck 写完、解说词写完 | `deck-pdf <deck>` 和 `review-doc <deck> --version v` | `<deck>-预览.pdf`（像 PPT 一样翻）、`解说词审定稿-<版本>.md`（画面要点 / 讲述要点降序 / 解说词 / 字数 vs 目标 / lint） | deck 任意；解说词逐页文本 |
+| **3 成片** | `build` 出片之后 | `qc <deck> --version v` | `质检报告.md`：实测时长与偏差、**逐页目标 vs 实际**、偏短页、音量、字幕抽样、重录勾选表 | 勾 `重录` 列标记要重录的页；调 `speed`、换参考录音 |
+
+- **Gate 1 是事前审**：大纲没过就不要写 deck。事后补的大纲救不了结构错误。
+- **Gate 2 里 deck 一改，必须重跑 `review`**：画面文字变了，解说词的数字溯源依据也跟着变。
+- **Gate 3 的 `qc` 不依赖 ffprobe**：总时长读 `narration.wav`，逐页时长读 `list.ffconcat`。
+- `outline.json` 的 schema：
+  ```json
+  {"project": "…", "audience": "…", "minutes": 14, "style": "…", "source": "…",
+   "pages": [{"title": "…", "kind": "cover|toc|section|content|data|closing",
+              "weight": 60, "fixed": null, "disc": false,
+              "points": ["画面要点…"], "notes": ["讲述要点，降序…"]}]}
+  ```
+  权重是**相对权重**；`fixed` 是固定秒数（不参与缩放，封面/目录/结尾用）。
+
+### 审核台（`review-ui`）
+
+```bash
+python ppt2video.py review-ui deck/index.html --version investor-14   # 四个 tab 都能用
+python ppt2video.py review-ui outline.json                            # 只审大纲
+```
+
+- **由 skill 在到达审核点时按需拉起**，不是常驻服务：在本机起 HTTP 服务，**前台阻塞到 owner 点「完成」**，然后写 `review-log.json`（时间 + 改了什么）并自动关闭。
+- 默认只绑 `127.0.0.1`（同机自动开浏览器）；`--host <tailnet IP>` 可让别的机器也能开，`--no-open` 关掉自动开浏览器。
+- 四个 tab：① 大纲 ② 画面 ③ 解说词 ④ 成片——**哪个有数据哪个可点**。
+- **只读展示 + 白名单写回**：能改的只有 `outline.json` 的字段、`narrations.json` 的逐页文本、`redo.json` 的重录标记。不跑 pipeline、不调 LLM。
+- 保存大纲前把上一版留成 `outline.json.bak`；保存解说词时**当场重跑 lint**（字数区间、套话、画面指代、数字溯源）并把问题标出来。
+- 成片区用 **Range 请求**提供视频（进度条能拖），旁边就是逐页"目标 vs 实际"和重录勾选表。
+
 ## 多版本：同一份幻灯片，不同时长
 
 同一份 PPT 对不同对象要讲不同时长（10 分钟给投资人、15 分钟给深度沟通、8 分钟给合作方）。
@@ -180,7 +220,7 @@ $PY ~/ppt2video.py build deck/index.html
 |---|---|---|
 | **总时长** | `versions.json` 的 `minutes` | 该版本的目标分钟数 |
 | **页权重** | `data-sec`（HTML）/ `slides.json` 的 `sec`（导入）| 相对权重，不是秒数；缺省 45。重点页给大值 |
-| **固定页** | `data-fixed="12"` / `slides.json` 的 `fixed` | 封面、目录、免责页固定秒数，不参与缩放 |
+| **固定页** | `data-fixed="12"` / `slides.json` 的 `fixed` | 封面、目录等固定秒数，不参与缩放 |
 | **跳页** | `versions.json` 的 `skip: [11, 12]` | 短版整页跳过附录/明细，比每页压到 15 秒好 |
 
 **关键：不要把"讲 10 分钟"直接告诉模型。** 模型对时长没有概念，字数会偏得很远。脚本按下面的公式把
@@ -275,7 +315,7 @@ python ppt2video.py build   路演.pptx --version investor-10
 - **语言**：规范书面语、只用陈述句（无问句/自问自答）、无口语俚语、无标签式引导语、不提及画面/表格/页码/左右位置、不用"首先其次最后"罗列。
 - **事实与确定性**：区分已实现/进行中/规划/预测，不把低一级说成高一级；"第一""领先"要有依据并保留口径。
 - **竞争对手**：只陈述可核实事实，中性词描述差异，不评价对手优劣。
-- **免责**：只出现在 `data-disclaimer` 页，措辞固定。
+- **免责**：**默认完全不出现**（deck 不加免责页，解说词不写免责/声明/风险提示）。owner 明确要求时才用 `--disclaimer` 启用，且只在 `data-disclaimer` 页、措辞固定。
 - **书写格式**：数字/百分比/单位用阿拉伯数字，由 `speak()` 转读法；字幕显示书面写法。
 - **配套**：`brief.md`（场景卡：受众/语气/主线/口径表/术语表/风格锚点）+ 可选 `pronounce.json`（专有名词读音）。
 

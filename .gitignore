@@ -2,3 +2,8 @@ video-output/
 __pycache__/
 *.pyc
 .DS_Store
+
+# 本地配置（端点/密钥不写进仓库）
+local.json
+*.local.json
+.env
