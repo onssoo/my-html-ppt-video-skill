@@ -205,3 +205,42 @@ def test_build_refuses_without_any_gate_record(tmp_path):
     deck = tmp_path / "deck.html"; deck.write_text("x")
     rc = m.cmd_build(str(out), [{"title": "a", "sec": 10, "text": [], "notes": []}], deck=str(deck))
     assert rc == 2                                          # 没审核记录 → 拒绝出片
+
+
+# ── 批 2：唯一字数公式 / 读法 / 读音表指纹 / 导入继承 ──────────
+def test_char_range_is_single_source():
+    assert m.char_range(45, 4.5) == (162, 263)                    # 规范 §八：0.8–1.3×
+    c = m.chars_for(45, 4.5)
+    assert m.char_range(45, 4.5, strict=True) == (int(c * 0.9), int(c * 1.1))   # 版本模式
+
+
+def test_read_rules_date_and_dimension():
+    assert "乘" in m.speak("1920x1080")                            # 尺寸不读成"倍"
+    out = m.speak("2026-10-07")
+    assert "到" not in out and "月" in out                          # 日期不被区间规则吃掉
+    assert "到" in m.speak("2026–2030 年")                          # 真区间仍然读"到"
+
+
+def test_pron_changes_cps_fingerprint():
+    cfg = {"backend": "qwen", "ref_audio": "x", "speed": 1.0}
+    before = m.tts_fingerprint(cfg)
+    m.PRON["测试专名"] = "测试专名读法"
+    assert m.tts_fingerprint(cfg) != before                        # 改读音 → 语速校准作废
+    m.PRON.pop("测试专名")
+
+
+def test_inherit_prev_unique_title_only():
+    old = [{"title": "目录", "sec": 12, "notes": ["a"]},
+           {"title": "目录", "sec": 20, "notes": ["b"]},           # 重名 → 不参与标题匹配
+           {"title": "正文", "sec": 40, "notes": ["c"]}]
+    new = [{"title": "正文", "sec": None, "notes": []},
+           {"title": "目录", "sec": None, "notes": []},
+           {"title": "新页", "sec": None, "notes": []}]
+    nt, np_, miss = m.inherit_prev(new, old)
+    assert new[0]["sec"] == 40 and new[0]["notes"] == ["c"]         # 唯一标题命中
+    assert new[1]["sec"] is None                                    # 重名标题不继承
+    assert miss == [2, 3]                                           # 页数变了 → 不按页码兜底
+    # 页数没变才允许按页码补
+    same = [{"title": "甲", "sec": None, "notes": []}, {"title": "乙", "sec": None, "notes": []}]
+    nt2, np2, miss2 = m.inherit_prev(same, [{"title": "甲", "sec": 12}, {"title": "丙", "sec": 30}])
+    assert nt2 == 1 and np2 == 1 and miss2 == []

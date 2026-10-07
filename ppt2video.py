@@ -33,6 +33,7 @@
 """
 import argparse, asyncio, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, time, wave
 import urllib.request
+from collections import Counter
 from html import escape as _esc
 from html.parser import HTMLParser
 from pathlib import Path
@@ -67,9 +68,6 @@ BANNED = {
     "口语俚语": ["干到", "手里的牌", "绑得很死", "难啃", "差远了", "一条龙", "拉远看", "根子", "把椅子"],
     "绝对化": ["绝对", "一层不落", "没有被撼动", "毫无疑问", "遥遥领先", "无可替代", "极强"],
 }
-MIN_SYNTH_CHARS = 0            # 【已停用】曾设 12 想把短句并入下一句以救音色，
-                              # 但实测用户判断更差：停顿被吃掉（"大家好"与下句连读）。声纹相似度
-
 # ─── 外部程序解析（本机实况：Edge 代替 Chrome；imageio-ffmpeg 代替系统 ffmpeg）───
 
 BROWSER_CANDIDATES = [
@@ -386,6 +384,36 @@ def pptx_slides(path):
     return slides
 
 
+def inherit_prev(slides, old):
+    """重新导入时继承上次手工改过的 sec / fixed / disc / notes。
+
+    规则（都是实测踩过的坑）：
+      1. **重名标题不参与**按标题匹配——多个"目录"、多个「（续）」页会互相串；
+      2. 每份旧设置**只继承一次**（used 集合），不会被两页同时拿走；
+      3. **页数变了就不按页码兜底**——插页会让后面每页整体错位；
+    返回 (按标题命中数, 按页码命中数, 没继承到的页码列表)。"""
+    tt = lambda o: (o.get("title") or "").strip()
+    cnt = Counter(tt(o) for o in old)
+    uniq = {tt(o): k for k, o in enumerate(old) if tt(o) and cnt[tt(o)] == 1}
+    used, got = set(), {}
+    for k, s in enumerate(slides):                     # 第一轮：标题唯一且相同
+        m = uniq.get(s["title"].strip())
+        if m is not None and m not in used:
+            got[k] = m; used.add(m)
+    n_title = len(got)
+    if len(old) == len(slides):                        # 第二轮：页数没变才按页码补
+        for k in range(len(slides)):
+            if k not in got and k not in used:
+                got[k] = k; used.add(k)
+    for k, m in got.items():
+        o, s = old[m], slides[k]
+        s["sec"], s["fixed"], s["disc"] = o.get("sec"), o.get("fixed"), o.get("disc", False)
+        if not s["notes"] and o.get("notes"):
+            s["notes"] = o["notes"]
+    miss = [k + 1 for k in range(len(slides)) if k not in got]
+    return n_title, len(got) - n_title, miss
+
+
 def cmd_import(deck, out):
     p, sj = Path(deck), Path(out, "slides.json")
     suf = p.suffix.lower()
@@ -414,23 +442,10 @@ def cmd_import(deck, out):
             old = []
         if len(old) != len(slides):
             print(f"⚠ 页数有变化（{len(old)} → {len(slides)}），已按页码保留旧的 sec / disc / notes，请核对")
-        by_title = {o.get("title", "").strip(): o for o in old if o.get("title")}
-        hit_title = 0
-        for idx, s in enumerate(slides):
-            o = by_title.get(s["title"].strip())
-            if o is not None:
-                hit_title += 1
-            elif idx < len(old):                       # 标题对不上才退回页码
-                o = old[idx]
-            if not o:
-                continue
-            s["sec"], s["disc"] = o.get("sec"), o.get("disc", False)
-            s["fixed"] = o.get("fixed")
-            if not s["notes"] and o.get("notes"):
-                s["notes"] = o["notes"]
-        print(f"  继承上次改动：按标题命中 {hit_title} 页"
-              + (f"，其余 {len(slides) - hit_title} 页按页码" if hit_title < len(slides) else ""))
-    sj.write_text(json.dumps(slides, ensure_ascii=False, indent=2), encoding="utf-8")
+        n_title, n_page, miss = inherit_prev(slides, old)
+        print(f"  继承上次改动：按标题 {n_title} 页，按页码 {n_page} 页")
+        if miss:
+            print(f"  ⚠ 第 {miss} 页没有继承（新页、改了标题或页数变化），请检查 sec / notes")
     empty = [i for i, s in enumerate(slides, 1) if not s["text"]]
     noted = sum(bool(s["notes"]) for s in slides)
     print(f"已写入 {sj}：{len(slides)} 页，{noted} 页有备注"
@@ -688,28 +703,6 @@ def sentences(text):
     return [s.strip() for s in re.findall(r"[^。！？；!?;…]+[。！？；!?;…]*", text) if s.strip()]
 
 
-def merge_short(segs, min_chars=MIN_SYNTH_CHARS):
-    """把过短的句子并到相邻句再合成 —— 克隆模型在极短文本上抓不住音色。
-
-    实测（2026-10-06，同一参考音频）：
-        大家好。        4 字 → 声纹相似度 0.9199，且只出 0.56s 音频（提前截断）
-        22 字长句           → 相似度 0.9838
-    合并后仍由 split_cue 按字数比例切回字幕，句级时间轴不受影响。
-    """
-    out, buf = [], ""
-    for seg in segs:
-        buf += seg
-        if len(buf) >= min_chars:
-            out.append(buf)
-            buf = ""
-    if buf:
-        if out:
-            out[-1] += buf          # 尾句太短 → 并入上一句
-        else:
-            out.append(buf)
-    return out
-
-
 def split_cue(s, start, end):
     """长句按逗号拆成多条字幕，时间按字数比例分配。"""
     s = s.rstrip("。！？；!?;…，,")
@@ -746,6 +739,25 @@ def ts(t):
 # ─── 书面写法 → 口语读法（字幕保留书面，配音读口语）────────
 PRON_FILE = Path(os.environ.get("PRONOUNCE", "pronounce.json"))
 PRON = json.loads(PRON_FILE.read_text(encoding="utf-8")) if PRON_FILE.exists() else {}
+
+
+def pron_hash():
+    """读音表也算语速指纹的一部分：改读音会改变音频长度。"""
+    return hashlib.sha1(json.dumps(PRON, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def load_pron(out=None, deck=None):
+    """读音表优先级：输出目录 > deck 同目录 > PRONOUNCE 环境变量 > 当前目录。"""
+    for c in (Path(out, "pronounce.json") if out else None,
+              Path(deck).parent / "pronounce.json" if deck else None,
+              PRON_FILE if os.environ.get("PRONOUNCE") else None):
+        if c and Path(c).exists():
+            try:
+                PRON.update(json.loads(Path(c).read_text(encoding="utf-8")))
+                print(f"  读音表：{c}（共 {len(PRON)} 条）")
+                return
+            except Exception as e:
+                print(f"  ⚠ 读不了读音表 {c}：{type(e).__name__}")
 # 单位/范围 → 读法（先于 cn2an，避免 cn2an 把 "ms" 当字母读）。
 # 用 (?![A-Za-z]) 而非 \b：数字后面常跟中文（"120ms降"），\b 在 CJK 前不成立。
 # 金额单位：万元到了"亿"的量级就折算成亿元（100000 万元 → 10亿元 → 十亿元）。
@@ -863,6 +875,22 @@ def cmd_check():
     print("必需依赖齐全" if ok else "缺少必需依赖")
 
 
+def _local_read(p):
+    """没有 docreader 时的本地兜底：docx 走 pandoc，pdf 走 pymupdf。读不了返回 None。"""
+    suf = p.suffix.lower()
+    try:
+        if suf == ".docx" and shutil.which("pandoc"):
+            return subprocess.run(["pandoc", str(p), "-t", "gfm", "--wrap=none"],
+                                  capture_output=True, text=True, check=True).stdout
+        if suf == ".pdf" and importlib.util.find_spec("fitz"):
+            import fitz
+            with fitz.open(p) as d:
+                return "\n\n".join(pg.get_text() for pg in d)
+    except Exception as e:
+        print(f"  ⚠ 本地解析失败：{type(e).__name__}: {str(e)[:60]}")
+    return None
+
+
 def load_source(path):
     """读源文档。md/txt 直接读；docx/xlsx/pptx/pdf/epub 走文档解析服务（DOCREADER）。"""
     import urllib.parse
@@ -873,25 +901,32 @@ def load_source(path):
         text = p.read_text(encoding="utf-8")
     else:
         ext = p.suffix.lower().lstrip(".")
-        if not DOCREADER:
-            sys.exit(f"{p.suffix} 需要文档解析服务把文件转成 Markdown，但没配置端点。\n"
-                     f"设 DOCREADER_URL 环境变量，或写进本地配置 {LOCAL_CONF}：\n"
-                     f'  {{"docreader": "http://<你的解析服务>:50052"}}\n'
-                     f"（也可以先把文档手动转成 .md 再喂给本工具）")
-        url = (f"{DOCREADER}/read?file_name={urllib.parse.quote(p.name)}"
-               f"&file_type={urllib.parse.quote(ext)}")
-        req = urllib.request.Request(url, data=p.read_bytes(),
-                                     headers={"Content-Type": "application/octet-stream"})
-        try:
-            with urllib.request.urlopen(req, timeout=600) as r:
-                res = json.load(r)
-        except Exception as e:
-            sys.exit(f"docreader 调用失败（{DOCREADER}）：{type(e).__name__}: {e}")
-        if not res.get("ok"):            # ⚠️ docreader 失败是 HTTP 200 + ok:false
-            sys.exit(f"docreader 解析失败：{str(res)[:300]}")
-        text = res.get("markdown") or ""
-        print(f"  docreader: {len(text)} 字符 / {res.get('image_count', 0)} 张图 / "
-              f"{res.get('elapsed_ms', '?')} ms / 引擎 {res.get('metadata', {}).get('engine', '?')}")
+        res = None
+        if DOCREADER:
+            import urllib.parse
+            url = (f"{DOCREADER}/read?file_name={urllib.parse.quote(p.name)}"
+                   f"&file_type={urllib.parse.quote(ext)}")
+            req = urllib.request.Request(url, data=p.read_bytes(),
+                                         headers={"Content-Type": "application/octet-stream"})
+            try:
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    res = json.load(r)
+            except Exception as e:
+                print(f"  ⚠ docreader 调用失败（{type(e).__name__}: {str(e)[:60]}），改用本地解析")
+        else:
+            print("  · 没配 DOCREADER，改用本地解析")
+        if res and res.get("ok"):
+            text = res.get("markdown") or ""
+            print(f"  docreader: {len(text)} 字符 / {res.get('image_count', 0)} 张图 / "
+                  f"{res.get('elapsed_ms', '?')} ms / 引擎 {res.get('metadata', {}).get('engine', '?')}")
+        else:
+            if res is not None:
+                print(f"  ⚠ docreader 解析失败：{str(res)[:200]}")
+            text = _local_read(p)
+            if text is None:
+                sys.exit(f"读不了 {p.name}：本地需要 " + ("pandoc（docx）" if ext == "docx" else "pymupdf（pdf）")
+                         + "，或配 DOCREADER_URL 指向文档解析服务")
+            print(f"  本地解析：{len(text)} 字符")
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)        # 去掉图片引用
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
@@ -973,11 +1008,31 @@ def parse_pages(s, n):
     return sorted(p for p in out if 1 <= p <= n)
 
 
-def page_floor(sec, lo):
-    """【单版本模式】有 data-sec 时按 时长×CPS×0.8 推字数下限，否则用全局 lo。只设下限不设上限。
-    版本模式（--version）不用这个，走 chars_for/allocate。"""
+def char_range(sec, cps, strict=False):
+    """**唯一**的字数区间公式。strict=版本模式（要控时长，±10%）；
+    否则按规范 §八 第 106 行：0.8–1.3×。别再各写一份。"""
+    if strict:
+        c = chars_for(sec, cps)
+        return int(c * 0.9), int(c * 1.1)
+    return int(sec * cps * 0.8), int(sec * cps * 1.3)
+
+
+def grounding(out, tdir, s, brief=""):
+    """数字溯源依据：本页画面 + 讲述要点 + 口径表 + 源文档。
+    **不含上一页解说**——否则前一页编造的数字会一路传下去。"""
+    parts = [s.get("title", ""), *s.get("text", []), *s.get("notes", [])]
+    for f in (Path(tdir) / "brief.md", Path(out) / "source.md"):
+        if Path(f).exists():
+            parts.append(Path(f).read_text(encoding="utf-8"))
+    if brief:
+        parts.append(brief)
+    return "\n".join(parts)
+
+
+def page_floor(sec, lo, cps=CPS):
+    """【单版本模式】有 data-sec 时按规范 0.8× 推字数下限，否则用全局 lo。只设下限不设上限。"""
     if sec:
-        return max(lo, int(sec * CPS * 0.8))
+        return max(lo, char_range(sec, cps)[0])
     return lo
 
 
@@ -1055,7 +1110,8 @@ def tts_fingerprint(cfg):
         voice = f"edge:{cfg.get('edge_voice')}:{cfg.get('edge_rate')}"
     return {"backend": cfg.get("backend"), "voice": voice,
             "speed": float(cfg.get("speed") or 1.0),
-            "speak": hashlib.sha1("".join(p.pattern for p, _ in _SPEAK_RULES).encode()).hexdigest()[:8]}
+            "speak": hashlib.sha1("".join(p.pattern for p, _ in _SPEAK_RULES).encode()).hexdigest()[:8],
+              "pron": pron_hash()}   # 读音表也要算进来
 
 
 def load_cps(out, cfg=None):
@@ -1144,8 +1200,8 @@ def lint(text, lo, grounded=None, disc=False):
     return issues
 
 
-def cmd_narrate(out, slides, v=None, source=None, pages=None, mode="auto", lo=100, hi=180,
-                brief=None, vision=False):
+def cmd_narrate(out, slides, v=None, source=None, pages=None,
+                lo=100, hi=180, brief=None, vision=False):
     """逐页生成解说词。每页独立调用 LLM（system 带本页的免责口径：默认关闭、禁止出现），不再整篇一次生成——
     整篇模式会让模型套用"承接→结论→引出"的固定结构，写出电报体碎句。
 
@@ -1192,13 +1248,13 @@ def cmd_narrate(out, slides, v=None, source=None, pages=None, mode="auto", lo=10
         src_seg = relevant(chunks, page) if chunks else ""
         prev = narr.get(str(i - 1), "")
         disc = pg.get("disc", False)
-        grounded = "\n".join([brief, page, notes, src_seg, prev])   # 数字溯源依据（含口径表）
+        grounded = grounding(out, tdir, pg, brief) + "\n" + src_seg   # 不含上一页解说
         if v:
             c = chars_for(secs[i], cps)
-            lo_i, hi_i = int(c * 0.9), int(c * 1.1)
+            lo_i, hi_i = char_range(secs[i], cps, strict=True)
             total_chars += c
         else:
-            lo_i, hi_i = page_floor(pg["sec"], lo), None
+            lo_i, hi_i = page_floor(pg["sec"], lo, cps or CPS), None
         system = NARRATE_SYSTEM.format(
             disclaimer=((DISCLAIMER if disc else "本页不涉及财务预测，不要说免责语。")
                         if DISCLAIMER_ON else NO_DISC_RULE),
@@ -1254,6 +1310,8 @@ def cmd_narrate(out, slides, v=None, source=None, pages=None, mode="auto", lo=10
         save()                                                    # 每页都存，中断不丢进度
         print(f"  ✔ 第 {i:2d} 页  {len(text)} 字"
               + (f"（目标 {lo_i}–{hi_i}）" if v else f"（下限 {lo_i}）"))
+        if iss:
+            print(f"    ⚠ 第 {i} 页重写 2 次后仍有问题：{iss}（已存进 narrations.json，可在审核台改）")
 
     miss = [i for i in range(1, n + 1) if i in (sorted(secs) if v else range(1, n + 1))
             and not narr.get(str(i))]
@@ -1449,10 +1507,7 @@ def cmd_build(out, slides, v=None, deck=None, force=False):
         sys.exit(f"这些页还没有解说词：{bad}")
     if not pages:
         sys.exit("所有页面都被跳过了")
-    # 读音表：优先用本片 video-output/pronounce.json（专有名词/化学元素），覆盖全局
-    pf = Path(out, "pronounce.json")
-    if pf.exists():
-        PRON.update(json.loads(pf.read_text(encoding="utf-8")))
+    load_pron(out, deck)          # 读音表：输出目录 > deck 同目录 > 环境变量
     tts = QwenTTS(cfg) if cfg["backend"] == "qwen" else EdgeTTS(cfg)
     print(f"配音模式: {'克隆 ' + tts.ref_audio if getattr(tts, 'clone', False) else '预置音色 ' + cfg['speaker']}")
     cache = Path(out, "tts-cache"); cache.mkdir(exist_ok=True)   # 各版本共用：同句只合成一次
@@ -1465,7 +1520,7 @@ def cmd_build(out, slides, v=None, deck=None, force=False):
     speech, chars = 0.0, 0                                          # 实测语速累计
     for num, text in pages:
         parts, cur = [silence(LEAD)], LEAD
-        seg_list = merge_short(sentences(text))
+        seg_list = sentences(text)
         spoken = [speak(s) for s in seg_list]          # TTS 读口语；字幕仍用书面 s
         for s, wavp in zip(seg_list, cached_many(tts, spoken, cache)):
             a = read_wav_sped(wavp, float(cfg.get("speed", 1.0) or 1.0), cache)
@@ -1644,7 +1699,7 @@ def cmd_outline(path, out_path=None):
         c = chars_for(secs[i], cps)
         L += [f"## P{i} {p.get('title', '')}", "",
               f"- 版式：{p.get('layout', '')}", f"- 时长：{secs[i]:.0f} 秒",
-              f"- 目标字数：{int(c * 0.9)}–{int(c * 1.1)}", ""]
+              f"- 目标字数：{char_range(secs[i], cps)[0]}–{char_range(secs[i], cps)[1]}", ""]
         if p.get("support"):
             L += ["- 支撑材料："] + [f"  - {x}" for x in p["support"]] + [""]
         if p.get("notes"):
@@ -1686,12 +1741,12 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
         s = slides[i - 1]
         lo = hi = None
         if secs:
-            c = chars_for(secs[i], cps); lo, hi = int(c * 0.9), int(c * 1.1)
+            lo, hi = char_range(secs[i], cps, strict=True)
         else:
             lo = page_floor(s["sec"], 100)
         txt = narr.get(str(i), "").strip()
         n = len(re.sub(r"\s", "", txt))
-        grounded = "\n".join([s["title"], *s["text"], *s["notes"]])
+        grounded = grounding(out, tdir, s)
         iss = lint(txt, lo, grounded, disc=s.get("disc", False))
         if hi and n > hi * OVER_TOL:
             iss.append(f"字数超出上限（{n} > {hi}）")
@@ -1751,7 +1806,6 @@ def cmd_qc(deck, out, v=None, out_path=None):
         elif m2 and cur:
             durs[cur] = durs.get(cur, 0) + float(m2.group(1))
             cur = None
-    target = sum(chars_for(secs[i], load_cps(out)) for i in secs) if secs else 0
     L = [f"# {Path(deck).stem} · 成片质检报告（{v['name'] if v else '单版本'}）", "",
          f"- 实际总时长 **{total / 60:.2f} 分钟**（{total:.1f} 秒）"
          + (f" · 目标 {v['minutes']} 分钟 · 偏差 **{total / (v['minutes'] * 60) - 1:+.0%}**" if v else ""),
@@ -1826,9 +1880,10 @@ def _outline_budget(o, cps=None):
     out = []
     for i, p in enumerate(o.get("pages", []), 1):
         c = chars_for(secs[i], cps)
+        _cr = char_range(secs[i], cps, strict=True)
         out.append({"n": i, "title": p.get("title", ""), "kind": p.get("kind", ""),
                     "weight": p.get("weight"), "fixed": p.get("fixed"), "disc": bool(p.get("disc")),
-                    "sec": round(secs[i], 1), "lo": int(c * 0.9), "hi": int(c * 1.1)})
+                    "sec": round(secs[i], 1), "lo": _cr[0], "hi": _cr[1]})
     return out, cps
 
 
@@ -2013,7 +2068,7 @@ def outline_md_budget(parsed, cps=None):
         sec = p["sec"] or 45
         out.append({"n": p["n"], "title": p["title"], "kind": "", "weight": None,
                     "fixed": None, "disc": False, "sec": sec,
-                    "lo": int(sec * cps * 0.8), "hi": int(sec * cps * 1.3)})
+                    "lo": char_range(sec, cps)[0], "hi": char_range(sec, cps)[1]})
     return out, cps, minutes
 
 
@@ -2155,7 +2210,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             iss = []
             if deck and b["n"] - 1 < len(sl):
                 s = sl[b["n"] - 1]
-                grounded = "\n".join([s["title"], *s["text"], *s["notes"]])
+                grounded = grounding(out, tdir, s)
                 iss = lint(t, b["lo"], grounded, disc=s.get("disc", False))
                 if n > b["hi"] * OVER_TOL:
                     iss.append(f"字数超出上限（{n} > {b['hi']}）")
@@ -2209,8 +2264,8 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             secs = page_seconds(sl, v["minutes"] * 60, v["skip"]) if v else {}
             budget = [{"n": i + 1, "title": s["title"], "kind": "", "weight": s["sec"],
                        "fixed": s["fixed"], "disc": s["disc"], "sec": round(secs.get(i + 1, 0), 1),
-                       "lo": int(chars_for(secs.get(i + 1, 0), cps) * 0.9),
-                       "hi": int(chars_for(secs.get(i + 1, 0), cps) * 1.1)} for i, s in enumerate(sl)]
+                       "lo": char_range(secs.get(i + 1, 0), cps)[0],
+                       "hi": char_range(secs.get(i + 1, 0), cps)[1]} for i, s in enumerate(sl)]
         state.clear()
         state.update({
             "name": Path(deck).stem if deck else tgt.stem, "target": str(tgt), "version": version,
@@ -2443,7 +2498,6 @@ def main():
     ap.add_argument("--pages", help="只重写指定页，如 3,5,7-9")
     ap.add_argument("--vision", action="store_true",
                     help="把每页截图一并发给模型（需多模态模型；图表/扫描页提取不到文字时用）")
-    ap.add_argument("--mode", choices=["auto", "full", "page"], default="page")
     ap.add_argument("--length", default="100-180",
                     help="【单版本模式】无 data-sec 的页用此字数下限（有 data-sec 时按 时长×CPS 推算）；"
                          "用 --version 时不生效，字数由版本总时长分配")
@@ -2502,7 +2556,7 @@ def main():
     if a.cmd == "narrate":
         lo, hi = map(int, a.length.split("-"))
         pgs = parse_pages(a.pages, len(slides)) if a.pages else None
-        cmd_narrate(out, slides, v, a.source, pgs, a.mode, lo, hi, a.brief, a.vision)
+        cmd_narrate(out, slides, v, a.source, pgs, lo, hi, a.brief, a.vision)
     else:
         cmd_review(deck, out, slides, a.reset, a.hash_start, v)
 
