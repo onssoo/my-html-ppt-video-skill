@@ -2643,6 +2643,15 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             except Exception as e:
                 print(f"⚠ 用 deck 生成解说词预算失败（{type(e).__name__}），退回大纲预算")
 
+        # 预检问题按页带上：owner 在审核台里就能看到「这页装不下 / 行列不齐」
+        outline_issues = {}
+        try:
+            for _is in outline_preflight(parsed):
+                outline_issues.setdefault(_is.get('page'), []).append(
+                    {'level': _is['level'], 'msg': _is['msg']})
+        except Exception as e:
+            print(f'⚠ 预检失败（{type(e).__name__}: {str(e)[:60]}）')
+
         state.clear()
         state.update({
             "name": Path(deck).stem if deck else tgt.stem, "target": str(tgt), "version": version,
@@ -2650,6 +2659,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             "outline_md_text": omd.read_text(encoding="utf-8") if omd else None,
             "outline_md_path": str(omd) if omd else None, "minutes": mins, "budget": budget,
             "slides": slides_of(), "narration": narration_of(budget),
+            "outline_issues": outline_issues,
             "video": video_of(budget), "ground": _ground_of(deck, out),
             "redo": json.loads((tdir / "redo.json").read_text(encoding="utf-8")) if (tdir / "redo.json").exists() else {},
             "cps": cps,

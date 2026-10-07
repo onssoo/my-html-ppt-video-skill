@@ -62,6 +62,7 @@
   details summary{cursor:pointer;color:var(--ink2);font-size:13px}
   .hint{color:var(--ink3);font-size:12.5px;margin:6px 0 0}
   .kv{display:flex;gap:18px;flex-wrap:wrap;color:var(--ink2);font-size:13px}
+  .iss{margin:2px 0 6px}.iss p{margin:2px 0;font-size:12.5px;line-height:1.45}
 </style>
 </head>
 <body>
@@ -202,7 +203,13 @@ async function oSave(payload) {
 function renderOutline() {
   const M = ST.outline_md, box = $('#o-pages');
   if (!M || !(M.pages || []).length) { box.innerHTML = '<div class="card dim">没有找到 大纲.md</div>'; return; }
+  const ISS = ST.outline_issues || {};
+  const allIss = Object.values(ISS).flat();
+  const nErr = allIss.filter(x => x.level === 'ERROR').length;
+  const nWarn = allIss.length - nErr;
   $('#o-stat').innerHTML = `<span>共 <b>${M.pages.length}</b> 页 · <b>${M.parts.length}</b> 部分</span>
+    <span class="${nErr ? 'err' : 'ok'}">ERROR ${nErr}</span>
+    <span class="${nWarn ? 'warn' : 'dim'}">WARN ${nWarn}</span>
     <span class="dim">${ST.outline_md_path || ''}</span>`;
   $('#v-page').className = 'act' + (oView === 'page' ? '' : ' ghost');
   $('#v-full').className = 'act' + (oView === 'full' ? '' : ' ghost');
@@ -234,6 +241,9 @@ function renderOutline() {
           el('button', { class: 'ghost', 'data-op': 'del', 'data-opn': n, text: '删' }),
           el('button', { class: 'ghost', 'data-addafter': n, text: '+ 加页' })
         ]),
+        /* 该页的结构/容量问题（来自 Gate ① 预检）*/
+        (ISS[n] || []).length ? el('div', { class: 'iss' }, (ISS[n] || []).map(x =>
+          el('p', { class: x.level === 'ERROR' ? 'err' : 'warn', text: (x.level === 'ERROR' ? '✘ ' : '⚠ ') + x.msg }))) : null,
         el('details', {}, [el('summary', { text: '▸ 正文（改：标题 / 版式 / 信息点 / 时长 / 讲述要点）' }), ta])
       ]));
     });
