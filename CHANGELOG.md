@@ -1,5 +1,15 @@
 # 本地化说明
 
+## 2026-10-07 · 审核点守卫（owner 规则）
+
+owner 定：**任何审核点必须等 owner 完成审核才能进下一步**，除非 owner 明确说明由 agent 负责审核校对。
+
+- 新增 `gate_guard()` / `find_gates_dir()`：`deck-skeleton` 需要 Gate ① 记录，`build` 需要 Gate ② 记录；
+  缺失或产物在通过后被改过 → 拒绝执行（退出码 2）；`--force` 只能由 owner 明确要求时使用。
+- 拒绝时的提示明确写出「agent 自检不算通过、不得自行判定」，避免 agent 拿自检结果当通行证。
+- SKILL.md 增补硬规则块；规则真源同时写入 `~/router/rules/owner-rules.md` 与 `LESSONS.md`。
+- 测试：`test_deck_skeleton_requires_gate1`（27 条断言）。
+
 来源：https://github.com/juguang/html-ppt-video-skill （master 分支）
 上游文件：SKILL.md（212 行）+ build_video.py（476 行）
 

@@ -368,3 +368,20 @@ def test_length_persisted_and_used_by_review_doc(tmp_path):
     assert "≥43" in next(l for l in doc.split("\n") if l.startswith("| 1 |"))   # 封面（非内容页）
     assert "≥162" in next(l for l in doc.split("\n") if l.startswith("| 3 |"))  # 内容页取大者
     assert "≥36" in next(l for l in doc.split("\n") if l.startswith("| 4 |"))   # 结尾（非内容页）
+
+
+# ── 审核点守卫：Gate ① 没通过不许开始做 slides（owner 2026-10-07 规则）──
+def test_deck_skeleton_requires_gate1(tmp_path):
+    import shutil
+    md = tmp_path / "大纲.md"
+    shutil.copy(Path(__file__).parent / "fixture-大纲.md", md)
+    sk = tmp_path / "deck-骨架.html"
+    assert m.cmd_deck_skeleton(str(md), str(sk)) == 2        # 没有 Gate ① 记录 → 拒绝
+    assert not sk.exists()
+    out = tmp_path / "video-output"; out.mkdir()
+    m.gates_approve(out, "outline", {"大纲": md})            # owner 点了「完成」
+    assert m.cmd_deck_skeleton(str(md), str(sk)) == 0
+    assert sk.exists()
+    md.write_text(md.read_text(encoding="utf-8") + "\n<!-- 改过 -->\n", encoding="utf-8")
+    assert m.cmd_deck_skeleton(str(md), str(sk)) == 2        # 通过后又改了 → 需重审
+    assert m.cmd_deck_skeleton(str(md), str(sk), force=True) == 0   # owner 明确要求才可越过

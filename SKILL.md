@@ -53,6 +53,7 @@ description: Use when converting a document, article, or existing slide deck int
 **Phase 2 · 做 slides**
 
 1. `python ppt2video.py deck-skeleton 大纲.md` → `deck-骨架.html`
+   （**Gate ① 没过会直接拒绝**：退出码 2，提示让 owner 先审）
    （每页一个 `<section class="slide" data-title="…" data-sec="45">` + 隐藏的 `<div class="notes">`）
 2. 版式从 `html-ppt-skill/references/layouts.md` 的骨架里选；模板 `dailei-business-deck`、主题 `dailei-business-navy`
 3. `check_deck.py deck/index.html --footer ".bd-foot" --fonts "Noto Serif SC,Noto Sans SC,Inter"`
@@ -91,6 +92,18 @@ $PY $P2V qc    deck/index.html        # 质检报告：时长偏差 / 逐页对�
 （逐页看截图、在 `slides.json` 里改 `sec`/`fixed`/`notes`、旧稿数字口径要先对齐）。
 
 ## 三个审核点（Gate 1 / 2 / 3）
+
+> ### ⛔ 硬规则（owner 2026-10-07）
+> **任何审核点都必须等 owner 完成审核才能进下一步。**
+> 唯一例外：owner **明确说明**「这个审核点由你负责审核校对」——此时才可由 agent 代审，
+> 且**汇报里必须写明「该审核点由我代审」**，不得含糊成「已通过」。
+>
+> - agent 自检、测试全绿、`check_deck.py` 无 ERROR **都不算**审核通过；
+> - **不得用 `--force` 绕过审核点**（除非 owner 明确要求）；
+> - 代码层面已经拦住：`deck-skeleton` 需要 **Gate ①** 记录、`build` 需要 **Gate ②** 记录，
+>   缺失或产物在通过后被改过 → **拒绝执行，退出码 2**；
+> - 通过的唯一方式是 owner 在审核台点「完成」（写入 `gates.json`）；
+> - 若为抢进度提前做了下游产物，必须**主动声明**，并在 owner 审核后重跑或撤销。
 
 每个阶段收尾都要产出**给人审的工作文件**，owner 改完再进下一步。三条命令都是**确定性的**（不调 LLM），随时可重跑。
 

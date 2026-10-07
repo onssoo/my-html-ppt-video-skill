@@ -1687,11 +1687,43 @@ def deck_section(page):
     return "\n".join(body)
 
 
-def cmd_deck_skeleton(md_path, out_path=None):
+def find_gates_dir(near):
+    """在产物附近找 gates.json（deck 旁边、或 video-output/ 里）。"""
+    for d in (Path(near), Path(near) / "video-output", Path(near).parent, Path(near).parent / "video-output"):
+        if (d / "gates.json").exists():
+            return d
+    return None
+
+
+def gate_guard(near, gate, files, label, force=False):
+    """审核点守卫：没有该审核点的记录（或产物在通过之后被改过）→ 拒绝进入下一步。
+
+    owner 2026-10-07 定的规则：**任何审核点都必须等 owner 完成审核才能进下一步**；
+    agent 自己的检查不算审核通过，也不得用 --force 绕过（除非 owner 明确要求）。
+    返回 True = 可以继续。"""
+    gd = find_gates_dir(near)
+    stale = gates_stale(gd, gate, files) if gd else None
+    if stale is None:
+        stale = [f"（从没见过 {label} 的审核记录）"]
+    if stale and not force:
+        print(f"✘ {label} 还没通过：{'、'.join(stale)}")
+        print("  规则（owner 2026-10-07）：任何审核点必须等 owner 完成审核才能进下一步。")
+        print("  agent 不得自行判定通过（自检/测试全绿都不算），也不得用 --force 绕过。")
+        print("  请先在审核台让 owner 点「完成」，再重跑本命令。")
+        return False
+    if force and stale:
+        print(f"⚠ 已用 --force 越过 {label}：{'、'.join(stale)}")
+    return True
+
+
+def cmd_deck_skeleton(md_path, out_path=None, force=False):
     """把 大纲.md 落成 deck 骨架（每页一个 <section>，含 data-title / data-sec / .notes）。"""
     p = Path(md_path)
     if not p.exists():
         sys.exit(f"没有 {p}")
+    # 门槛：大纲这一关（Gate ①）没过，不许开始做 slides
+    if not gate_guard(p.parent, "outline", {"大纲": p}, "Gate ①（大纲）", force):
+        return 2
     doc = parse_outline_md(p.read_text(encoding="utf-8"))
     if not doc["pages"]:
         sys.exit("没解析到页：页标题要写成『## P5 结论式标题』")
@@ -2653,7 +2685,7 @@ def main():
     if a.cmd == "deck-skeleton":               # 大纲 → deck 骨架（规范 §六）
         if not a.deck:
             ap.error("deck-skeleton 需要 大纲.md 路径")
-        return cmd_deck_skeleton(a.deck, a.out)
+        return cmd_deck_skeleton(a.deck, a.out, force=a.force)
     if a.cmd == "review-ui":                   # 审核台：前台阻塞到 owner 点完成
         if not a.deck:
             ap.error("review-ui 需要 outline.json 或 deck 路径")
