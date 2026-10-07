@@ -1233,6 +1233,7 @@ def cmd_narrate(out, slides, v=None, source=None, pages=None,
     v 不为 None 时走版本模式：总时长按权重分到每页，再换算成每页字数目标；
     v["from"] 有值时从母版的解说词**压缩**，而不是重新创作。"""
     tdir = v["dir"] if v else Path(out)
+    load_pron(out, Path(out).parent)   # 读音表进 cps 指纹：这里不加载会误判校准失效
     n = len(slides)
     write_outline(tdir, slides)
     nj, rv = tdir / "narrations.json", tdir / "review.md"
@@ -1766,6 +1767,7 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
     """Gate 2：逐页解说词审定稿——画面要点 / 讲述要点（降序）/ 解说词 / 字数 vs 目标 / lint。
     lint 只卡下限，版本模式下上限就是时长控制本身，所以这里按 narrate 的同一容忍度补一条上限检查。"""
     tdir = v["dir"] if v else Path(out)
+    load_pron(out, Path(out).parent)
     try:
         slides = load_slides(deck, out)
     except SystemExit:

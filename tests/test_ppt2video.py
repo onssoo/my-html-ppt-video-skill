@@ -300,3 +300,19 @@ def test_cmd_review_doc_runs(tmp_path):
     rc = m.cmd_review_doc(str(deck), out, None, str(tmp_path / "审定稿.md"))
     assert rc == 0
     assert (tmp_path / "审定稿.md").exists()
+
+
+# ── 读音表进指纹的连锁：谁算指纹谁就必须先 load_pron（自查发现）──
+def test_project_pronounce_must_be_loaded_before_fingerprint(tmp_path):
+    """项目里有 pronounce.json 时：load_pron 之后指纹才与校准时一致。"""
+    out = tmp_path / "video-output"; out.mkdir()
+    (out / "pronounce.json").write_text(_json.dumps({"Pt": "铂"}, ensure_ascii=False), encoding="utf-8")
+    cfg = {"backend": "qwen", "ref_audio": "/x.wav", "speed": 1.0}
+    m.PRON.clear(); m.load_pron(out, tmp_path)
+    fp_cal = m.tts_fingerprint(cfg)
+    (out / "cps.json").write_text(_json.dumps({"cps": 4.43, "fingerprint": fp_cal}), encoding="utf-8")
+    m.PRON.clear()                                          # 模拟"没加载读音表"的调用方
+    assert m.tts_fingerprint(cfg) != fp_cal                 # 指纹会不同 → 会误判作废
+    assert m.load_cps(out, cfg) != 4.43
+    m.PRON.clear(); m.load_pron(out, tmp_path)              # 加载后恢复正常
+    assert m.load_cps(out, cfg) == 4.43
