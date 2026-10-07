@@ -1,5 +1,20 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>fixture deck</title></head>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>fixture deck</title>
+<style>.slide{display:none}.slide.on{display:block}</style></head>
 <body><div class="deck">
 <section class="slide" data-title="封面" data-sec="12"><h1>小样本封面</h1><div class="notes">1. 甲</div></section>
 <section class="slide" data-title="正文页" data-sec="40"><h1>小样本正文</h1><div class="notes">1. 乙</div></section>
-</div></body></html>
+</div>
+<script>
+/* 最小可翻页实现：#/N 深链（1 起），与 ppt2video 的 --hash-start 一致 */
+function show() {
+  var m = (location.hash || '#/1').match(/#\/(\d+)/);
+  var n = m ? +m[1] : 1;
+  document.querySelectorAll('.slide').forEach(function (s, i) {
+    s.classList.toggle('on', i + 1 === n);
+  });
+}
+addEventListener('hashchange', show);
+addEventListener('load', show);
+show();
+</script>
+</body></html>
