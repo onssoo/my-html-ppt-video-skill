@@ -1866,9 +1866,11 @@ def outline_preflight(parsed, src_text=None):
         k = len(p["notes"])
         if not 3 <= k <= 5:
             add("WARN", f"讲述要点 {k} 条（规范 §一 第 26 行：3–5 条）", n)
-        no_cite = [x for x in p["notes"] if not RE_CITE.search(x)]
+        # 只卡「含数字/事实但没出处」的要点——出处的用途是给解说词溯源（规范 §八 第 102 行），
+        # 不是给每句话挂来源；出处写在幕后要点里，不进画面（规范 §一 第 26 行「画面上不写」）。
+        no_cite = [x for x in p["notes"] if re.search(r"\d", x) and not RE_CITE.search(x)]
         if no_cite:
-            add("WARN", f"{len(no_cite)} 条讲述要点没注明出处（规范 §一 第 26 行要求每条注明）", n)
+            add("WARN", f"{len(no_cite)} 条含数字的讲述要点没注明出处（§一 第 26 行；出处只写在幕后要点，不进画面）", n)
         blob = "\n".join([t, p["layout"], p["chunk"]])
         # 剥掉出处标注：`（源文档 免责声明 1）` 是在引用源文档的小节名，不是本页写了免责
         blob = re.sub(r"[（(][^）)]{0,40}(?:源文档|§|第\s*\d)[^）)]{0,40}[）)]", " ", blob)
