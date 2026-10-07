@@ -2471,10 +2471,10 @@ def capacity_issues(page):
     est = estimate_page(page)
     if est["slack"] < 999:
         if est["slack"] < 0:
-            out.append(("ERROR", f"预估内容高于画布：占用 {est['used']}/830px"
+            out.append(("ERROR", f"预估内容高于画布：占用 {est['used']}/{GEOM['body']}px"
                                  f"（超出 {-est['slack']}px）—— 按规范 §三 第 62 行精简/换版式/拆页"))
         elif est["slack"] < 120:
-            out.append(("WARN", f"预估余量只有 {est['slack']}px（占用 {est['used']}/830px）"
+            out.append(("WARN", f"预估余量只有 {est['slack']}px（占用 {est['used']}/{GEOM['body']}px）"
                                 "—— 接近上限，建议精简一处"))
     return out
 
