@@ -63,6 +63,7 @@
   .hint{color:var(--ink3);font-size:12.5px;margin:6px 0 0}
   .kv{display:flex;gap:18px;flex-wrap:wrap;color:var(--ink2);font-size:13px}
   .iss{margin:2px 0 6px}.iss p{margin:2px 0;font-size:12.5px;line-height:1.45}
+  .issdet summary{cursor:pointer;font-size:12.5px;color:#b8860b;margin:2px 0}
 </style>
 </head>
 <body>
@@ -241,10 +242,22 @@ function renderOutline() {
           el('button', { class: 'ghost', 'data-op': 'del', 'data-opn': n, text: '删' }),
           el('button', { class: 'ghost', 'data-addafter': n, text: '+ 加页' })
         ]),
-        /* 该页的结构/容量问题（来自 Gate ① 预检）*/
-        (ISS[n] || []).length ? el('div', { class: 'iss' }, (ISS[n] || []).map(x =>
-          el('p', { class: x.level === 'ERROR' ? 'err' : 'warn', text: (x.level === 'ERROR' ? '✘ ' : '⚠ ') + x.msg }))) : null,
-        el('details', {}, [el('summary', { text: '▸ 正文（改：标题 / 版式 / 信息点 / 时长 / 讲述要点）' }), ta])
+        /* 该页的结构/容量问题（来自 Gate ① 预检）：ERROR 直接显示，提醒折叠，别糊满屏 */
+          (() => {
+            const list = ISS[n] || [];
+            if (!list.length) return null;
+            const errs = list.filter(x => x.level === 'ERROR');
+            const warns = list.filter(x => x.level !== 'ERROR');
+            const kids = errs.map(x => el('p', { class: 'err', text: '✘ ' + x.msg }));
+            if (warns.length) {
+              kids.push(el('details', { class: 'issdet' }, [
+                el('summary', { text: `⚠ ${warns.length} 条容量提醒（点开看）` }),
+                ...warns.map(x => el('p', { class: 'warn', text: '⚠ ' + x.msg }))
+              ]));
+            }
+            return el('div', { class: 'iss' }, kids);
+          })(),
+          el('details', {}, [el('summary', { text: '▸ 正文（改：标题 / 版式 / 信息点 / 时长 / 讲述要点）' }), ta])
       ]));
     });
   });
