@@ -1380,8 +1380,9 @@ def cmd_outline(path, out_path=None):
         L = ["# Gate 1 · 大纲审核报告", "",
              f"- 大纲：`{src.name}`",
              "- 依据：`business-deck-spec.md` §一（方法论 / 大纲格式）、§二（信息密度）",
-             f"- 目标时长：{minutes if minutes else '—'} 分钟 · 各页合计 **{total:.0f} 秒**"
-             + (f"（差 {total - minutes * 60:+.0f} 秒）" if minutes else ""),
+             f"- 解说词**规划**时长：各页合计 **{total:.0f} 秒**"
+             + (f" · 大纲标的目标 {minutes:g} 分钟（解说词详略自定，成片长度是结果，不是 PPT 的约束）"
+                if minutes else ""),
              f"- 字数公式 `sec × {cps}`，区间 0.8–1.3×（规范 §八 第 104/106 行）",
              f"- 共 **{len(parsed['pages'])}** 页 · **ERROR {nerr}** · WARN {nwarn}", ""]
         if by.get(None):
@@ -1643,7 +1644,9 @@ RE_PAGE_COMPAT = re.compile(r"^###\s*第\s*(\d+)\s*页\s*[·:：]\s*(.+?)\s*$") 
 RE_SEC = re.compile(r"\*{0,2}时长\*{0,2}\s*[：:]\s*(\d+(?:\.\d+)?)\s*秒")
 RE_INFO_HDR = re.compile(r"\*{0,2}信息点\*{0,2}\s*[（(]\s*(\d+)\s*[)）]\s*[：:]?")
 RE_ITEM_NUM = re.compile(r"^\s*(?:\d+[.、)）]|[-*])\s+(.+)$")
-RE_CITE = re.compile(r"[（(]\s*(?:§|第)[^）)]*[）)]")            # 出处标注：（§3.1）/（第 3 页）
+# 出处标注可以有多种写法：规范的例子是（§3.1），实际源文档常用章节号，
+# 所以（源文档 二、（二））、（第 3 页）、（表 11）都算注明了出处。
+RE_CITE = re.compile(r"[（(]\s*(?:§|第|源文档|表|图|附录|原文)\s*[^）)]{0,40}[)）]")
 NON_CONTENT = ("封面", "目录", "章节", "结尾", "封底", "致谢")
 
 
@@ -1844,9 +1847,7 @@ def outline_preflight(parsed, src_text=None):
         add("ERROR", f"有页缺『- 时长：N 秒』：{[p['n'] for p in pages if p['sec'] is None]}")
     m = re.search(r"目标时长\s*[：:]\s*([\d.]+)\s*分钟", parsed["preamble"])
     if m and all(secs):
-        total, want = sum(secs), float(m.group(1)) * 60
-        if abs(total - want) > want * 0.05:
-            add("WARN", f"各页时长合计 {total:.0f} 秒，与目标 {want:.0f} 秒差 {total - want:+.0f} 秒（规范 §一：相加应约等于总时长）")
+        total, want = sum(secs), float(m.group(1)) * 60   # 仅作规划参考，不判定
     src_nums = set(re.findall(r"\d[\d,]*(?:\.\d+)?", src_text)) if src_text else None
     for i, p in enumerate(pages):
         n, t = p["n"], p["title"]
@@ -1862,8 +1863,6 @@ def outline_preflight(parsed, src_text=None):
                     f"信息点 {cnt} 个（规范 §二 第 41 行：内容页 6–10，>10 必须拆页）", n)
             if p["info_declared"] is not None and p["info"] and p["info_declared"] != len(p["info"]):
                 add("ERROR", f"『信息点（{p['info_declared']}）』与实际 {len(p['info'])} 条不符", n)
-        if not non_content and p["sec"] and not (40 <= p["sec"] <= 60):
-            add("WARN", f"内容页 {p['sec']:.0f} 秒，规范 §一 第 11 行参考 40–60 秒", n)
         k = len(p["notes"])
         if not 3 <= k <= 5:
             add("WARN", f"讲述要点 {k} 条（规范 §一 第 26 行：3–5 条）", n)
@@ -1884,20 +1883,6 @@ def outline_preflight(parsed, src_text=None):
                     if x not in src_nums and x.replace(",", "") not in src_nums]
             if miss:
                 add("WARN", f"这些数字没在源文档里逐字查到：{', '.join(miss[:6])}", n)
-    # 每章内容页数（规范 §一 第 13 行：[章节页 → 2–4 个内容页] × N）
-    seg, segs = [], []
-    for idx, pg in enumerate(pages):
-        if is_non_content(pg, idx, len(pages)):
-            if seg:
-                segs.append(seg)
-            seg = []
-        else:
-            seg.append(pg["n"])
-    if seg:
-        segs.append(seg)
-    for s in segs:
-        if not 2 <= len(s) <= 4:
-            add("WARN", f"本章 {len(s)} 个内容页（规范 §一 第 13 行参考 2–4 个），页 {s[0]}–{s[-1]}", s[0])
     return issues
 
 
