@@ -145,6 +145,8 @@ DEFAULTS = {
     "edge_voice": "zh-CN-YunxiNeural",
     "edge_rate": "+5%",
     "subtitles": "burn",          # burn（烧录）/ soft（软字幕）/ off
+    # 单版本模式的每页字数区间（下限用于卡"偏短"，封面/目录/章节/结尾页见 page_floor 的豁免）
+    "length": "100-180",
     "speed": 1.15,                # 变速（ffmpeg atempo，不变调）。模型自带的 speed 参数在克隆模式下无效，只能后处理
     # —— 画面构图（导入的旧 PPTX/PDF 没有预留字幕区时用 letterbox）——
     "frame": "fit",               # fit：铺满画面，居中留边；letterbox：画面上移，底部留 120px 给字幕
@@ -477,6 +479,25 @@ def load_slides(deck, out):
 
 
 # ─── review.md ───────────────────────────────────────────
+
+def set_review_cfg(rv, **kv):
+    """在 review.md 的 YAML 头里更新/追加配置项（不动正文与解说词）。"""
+    p = Path(rv)
+    txt = p.read_text(encoding="utf-8")
+    m = re.match(r"---\n(.*?)\n---\n", txt, re.S)
+    if not m:
+        return False
+    head = m.group(1).splitlines()
+    for k, val in kv.items():
+        for i, line in enumerate(head):
+            if line.split(":", 1)[0].strip() == k:
+                head[i] = f"{k}: {val}"
+                break
+        else:
+            head.append(f"{k}: {val}")
+    p.write_text("---\n" + "\n".join(head) + "\n---\n" + txt[m.end():], encoding="utf-8")
+    return True
+
 
 def write_review(path, slides, narr, cfg, skip=(), slides_dir=None):
     d = Path(path).parent
@@ -1258,6 +1279,9 @@ def cmd_narrate(out, slides, v=None, source=None, pages=None,
     v 不为 None 时走版本模式：总时长按权重分到每页，再换算成每页字数目标；
     v["from"] 有值时从母版的解说词**压缩**，而不是重新创作。"""
     tdir = v["dir"] if v else Path(out)
+    _rv0 = Path(tdir) / "review.md"
+    if _rv0.exists():                      # 生效的 --length 落盘，review-doc 与审核台据此显示同一套区间
+        set_review_cfg(_rv0, length=f"{lo}-{hi}")
     load_pron(out, Path(out).parent)   # 读音表进 cps 指纹：这里不加载会误判校准失效
     n = len(slides)
     write_outline(tdir, slides)
@@ -1809,6 +1833,12 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
     narr = json.loads(nj.read_text(encoding="utf-8"))
     iters = sorted(secs, key=int) if secs else range(1, len(slides) + 1)
     rows = ["| 页 | 标题 | 时长 | 目标字数 | 实际 | lint |", "|---|---|---|---|---|---|"]
+    _rvd = tdir / "review.md"
+    try:                                       # 单版本下限：读 review.md 里生效的 --length
+        _glo = int(str(parse_review(_rvd)[0].get("length") or DEFAULTS["length"]).split("-")[0]) \
+            if _rvd.exists() else int(DEFAULTS["length"].split("-")[0])
+    except Exception:
+        _glo = int(DEFAULTS["length"].split("-")[0])
     blocks, tot, tot_t, nbad = [], 0, 0, 0
     for i in iters:
         i = int(i)
@@ -1818,7 +1848,7 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
             lo, hi = char_range(secs[i], cps, strict=True)
         else:
             _content = not slide_is_non_content(s, i, len(slides))
-            lo = page_floor(s["sec"], 100, cps, content=_content)
+            lo = page_floor(s["sec"], _glo, cps, content=_content)
         txt = narr.get(str(i), "").strip()
         n = len(re.sub(r"\s", "", txt))
         grounded = grounding(out, tdir, s)
@@ -2342,6 +2372,13 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                        "fixed": s["fixed"], "disc": s["disc"], "sec": round(secs.get(i + 1, 0), 1),
                        "lo": char_range(secs.get(i + 1, 0), cps)[0],
                        "hi": char_range(secs.get(i + 1, 0), cps)[1]} for i, s in enumerate(sl)]
+        _glo_ui = int(DEFAULTS["length"].split("-")[0])
+        try:
+            _rv_ui = tdir / "review.md"
+            if _rv_ui.exists():
+                _glo_ui = int(str(parse_review(_rv_ui)[0].get("length") or DEFAULTS["length"]).split("-")[0])
+        except Exception:
+            pass
         if deck:                                  # 解说词按 deck 的页出（拆页后大纲页数会少）
             try:
                 _sl = load_slides(deck, out)
@@ -2353,7 +2390,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                         continue
                     _sec = _secs.get(_i, _s.get("sec") or 45)
                     _content = not slide_is_non_content(_s, _i, len(_sl))
-                    _lo = page_floor(_sec, 100, cps, content=_content)
+                    _lo = page_floor(_sec, _glo_ui, cps, content=_content)
                     _hi = char_range(_sec, cps, strict=True)[1] if v else None
                     budget.append({"n": _i, "title": _s["title"], "kind": "", "weight": None,
                                    "fixed": None, "disc": bool(_s.get("disc")),
@@ -2593,8 +2630,8 @@ def main():
     ap.add_argument("--pages", help="只重写指定页，如 3,5,7-9")
     ap.add_argument("--vision", action="store_true",
                     help="把每页截图一并发给模型（需多模态模型；图表/扫描页提取不到文字时用）")
-    ap.add_argument("--length", default="100-180",
-                    help="【单版本模式】无 data-sec 的页用此字数下限（有 data-sec 时按 时长×CPS 推算）；"
+    ap.add_argument("--length",
+                    help="单版本模式的每页字数下限-上限（默认 100-180）；生效值写进 review.md，review-doc 与审核台都读它。"
                          "用 --version 时不生效，字数由版本总时长分配")
     ap.add_argument("--version", help="versions.json 里的版本名（如 investor-10）；不传则走单版本流程")
     ap.add_argument("--force", action="store_true",
@@ -2658,7 +2695,15 @@ def main():
     if a.cmd == "build":
         return cmd_build(out, slides, v, deck=deck, force=a.force)
     if a.cmd == "narrate":
-        lo, hi = map(int, a.length.split("-"))
+        _ln = a.length
+        if not _ln:                              # 命令行没传就读 review.md 里上次生效的值
+            _rv = (v["dir"] if v else out) / "review.md"
+            if _rv.exists():
+                try:
+                    _ln = parse_review(_rv)[0].get("length")
+                except Exception:
+                    _ln = None
+        lo, hi = map(int, (_ln or DEFAULTS["length"]).split("-"))
         pgs = parse_pages(a.pages, len(slides)) if a.pages else None
         cmd_narrate(out, slides, v, a.source, pgs, lo, hi, a.brief, a.vision)
     else:

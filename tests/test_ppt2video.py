@@ -335,3 +335,36 @@ def test_non_content_pages_exempt_from_global_floor():
     assert m.page_floor(12, 100, 4.5, content=False) == spec          # 封面：豁免
     assert m.page_floor(12, 100, 4.5, content=True) == 100            # 内容页：仍是 100
     assert m.page_floor(45, 100, 4.5, content=True) == m.char_range(45, 4.5)[0]   # 162 > 100
+
+
+# ── --length 持久化到 review.md，三处读同一个值（owner 2026-10-07 第 2 条）──
+def test_length_persisted_and_used_by_review_doc(tmp_path):
+    """--length 的生效值写进 review.md；review-doc 与审核台都读它（owner 2026-10-07 第 2 条）。"""
+    out = tmp_path / "video-output"; out.mkdir()
+    deck = tmp_path / "deck.pptx"; deck.write_text("x")
+    slides = [{"title": "封面", "text": ["甲"], "notes": [], "sec": 12, "fixed": None, "disc": False},
+              {"title": "短内容页", "text": ["乙"], "notes": [], "sec": 12, "fixed": None, "disc": False},
+              {"title": "长内容页", "text": ["丙"], "notes": [], "sec": 45, "fixed": None, "disc": False},
+              {"title": "谢谢", "text": ["丁"], "notes": [], "sec": 10, "fixed": None, "disc": False}]
+    (out / "slides.json").write_text(_json.dumps(slides, ensure_ascii=False), encoding="utf-8")
+    m.write_review(out / "review.md", slides, {}, dict(m.DEFAULTS), skip=(), slides_dir=out / "slides")
+    (out / "narrations.json").write_text(
+        _json.dumps({str(i): "占位解说词。" * 12 for i in range(1, 5)}, ensure_ascii=False), encoding="utf-8")
+
+    rv = out / "review.md"
+    assert m.parse_review(rv)[0]["length"] == "100-180"          # ① 新建即带默认值
+
+    # ② 默认下限下：12 秒的"内容页"被要求 100 字（旧行为）
+    m.cmd_review_doc(str(deck), out, None, str(tmp_path / "a.md"))
+    row2 = next(l for l in (tmp_path / "a.md").read_text(encoding="utf-8").split("\n") if l.startswith("| 2 |"))
+    assert "≥100" in row2
+
+    # ③ 落盘自定义 length 后，同一个页面按 40 起算 → max(40, 43) = 43
+    assert m.set_review_cfg(rv, length="40-200") is True
+    assert m.parse_review(rv)[0]["length"] == "40-200"
+    m.cmd_review_doc(str(deck), out, None, str(tmp_path / "b.md"))
+    doc = (tmp_path / "b.md").read_text(encoding="utf-8")
+    assert "≥43" in next(l for l in doc.split("\n") if l.startswith("| 2 |"))
+    assert "≥43" in next(l for l in doc.split("\n") if l.startswith("| 1 |"))   # 封面（非内容页）
+    assert "≥162" in next(l for l in doc.split("\n") if l.startswith("| 3 |"))  # 内容页取大者
+    assert "≥36" in next(l for l in doc.split("\n") if l.startswith("| 4 |"))   # 结尾（非内容页）
