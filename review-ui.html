@@ -36,7 +36,6 @@
   input,select,textarea{background:#0b0e13;color:var(--ink);border:1px solid var(--line);border-radius:6px;
                         padding:6px 8px;font:inherit;font-size:14px;width:100%}
   textarea{resize:vertical;line-height:1.55;min-height:48px}
-  input.num{width:76px}input.ttl{max-width:320px}
   input[type=checkbox]{width:auto}
   .two{display:grid;grid-template-columns:1fr 300px;gap:12px}
   .badge{padding:1px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--ink2)}
@@ -176,7 +175,10 @@ async function api(path, body) {
   return r.json();
 }
 let ST = null, cur = { d: 0, n: 1 };
+let curTab = 'outline';
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 function tab(g) {
+  curTab = g;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.g === g));
   ['outline', 'deck', 'narration', 'video'].forEach(k => $('#s-' + k).classList.toggle('on', k === g));
 }
@@ -239,8 +241,11 @@ function renderOutline() {
 }
 document.addEventListener('click', e => {
   const d = e.target.dataset || {};
-  if (d.op) oSave({ op: d.op, n: +d.opn });
-  else if (d.addafter !== undefined) oSave({ op: 'add', n: +d.addafter });
+  if (d.op || d.addafter !== undefined) {
+    if (oDirty && !confirm('还有未保存的改动，结构操作会丢掉它们。继续？')) return;
+    if (d.op) oSave({ op: d.op, n: +d.opn });
+    else oSave({ op: 'add', n: +d.addafter });
+  }
 });
 $('#save-outline').onclick = () => {
   if (oView === 'full') return oSave({ full: $('#o-full').value });
@@ -302,7 +307,11 @@ function renderN() {
   $('#n-range').textContent = b.lo ? `${b.lo}–${b.hi}` : '—';
   updateCount();
   const g = (ST.ground || {})[String(cur.n)];
-  $('#n-ground').innerHTML = g ? `<div class="dim">画面上的文字（数字溯源的依据）</div><div style="margin-top:6px">${g}</div>` : '';
+  const gb = $('#n-ground'); gb.innerHTML = '';
+  if (g) {
+    gb.appendChild(el('div', { class: 'dim', text: '画面上的文字（数字溯源的依据）' }));
+    gb.appendChild(el('div', { style: 'margin-top:6px', text: g }));
+  }
   $('#n-issues').innerHTML = (d.issues || []).length ? `<span class="err">⚠ ${d.issues.join('；')}</span>` : '<span class="ok">✔ lint 通过</span>';
 }
 $('#n-text').addEventListener('input', updateCount);
@@ -323,7 +332,10 @@ function renderVideo() {
   const rows = (v.pages || []).map(p => `<tr><td>${p.n}</td><td>${p.title || ''}</td><td>${p.target || '—'}</td>
     <td>${p.actual || '—'}</td><td class="${p.short ? 'warn' : 'dim'}">${p.dev || '—'}</td>
     <td><input type="checkbox" data-rn="${p.n}" ${(ST.redo || {})[p.n] ? 'checked' : ''}></td>
-    <td><input data-rnote="${p.n}" value="${((ST.redo || {})[p.n] || {}).note || ''}" placeholder="原因"></td></tr>`).join('');
+    <td><input data-rnote="${p.n}" placeholder="原因"></td></tr>`).join('');
+  requestAnimationFrame(() => document.querySelectorAll('[data-rnote]').forEach(i => {
+    i.value = ((ST.redo || {})[i.dataset.rnote] || {}).note || '';
+  }));
   $('#v-qc').innerHTML = `<div class="kv"><span>实际 <b>${v.minutes}</b></span><span>目标 <b>${v.target || '—'}</b></span>
     <span>偏差 <b>${v.dev || '—'}</b></span><span>峰值 <b>${v.peak || '—'}</b></span></div>
     <table style="margin-top:10px"><thead><tr><th style="width:40px">页</th><th>标题</th><th style="width:70px">目标</th>
@@ -340,7 +352,7 @@ $('#save-redo').onclick = async () => {
 $('#done').onclick = async () => {
   if (oDirty && !confirm('还有未保存的改动，先点「保存」再完成。\n仍然要直接完成审核吗？（未保存的改动会丢）')) return;
   if (!oDirty && !confirm('完成审核？服务会保存并关闭，改动交回流程。')) return;
-  try { const r = await api('/done', {});
+  try { const r = await api('/done', { tab: curTab });
         document.body.innerHTML = `<div style="padding:60px;text-align:center;font-size:17px">✓ 审核已完成，服务已关闭。<br>
           <span style="color:#9aa7b8;font-size:14px">${r.summary || ''}</span></div>`; }
   catch (err) { toast('关闭失败：' + err.message, 'bad'); }
@@ -353,9 +365,10 @@ $('#done').onclick = async () => {
   let first = null;
   document.querySelectorAll('.tabs button').forEach(b => {
     b.disabled = !has[b.dataset.g];
-    if (has[b.dataset.g] && !first) { first = b.dataset.g; b.classList.add('on'); }
+    b.onclick = () => { if (!b.disabled) tab(b.dataset.g); };
+    if (has[b.dataset.g] && !first) first = b.dataset.g;
   });
-  tab(first || 'outline');
+  tab((ST.gate && has[ST.gate]) ? ST.gate : (first || 'outline'));
   if (has.outline) renderOutline();
   if (has.deck) renderDeck();
   if (has.narration) { cur.n = (ST.budget || [])[0] ? ST.budget[0].n : 1; renderNList(); renderN(); }

@@ -10,3 +10,7 @@ local.json
 
 # 审核台保存时留的备份
 *.bak
+
+# 输出目录与测试缓存
+*-video/            # 路线 B 的输出目录
+.pytest_cache/

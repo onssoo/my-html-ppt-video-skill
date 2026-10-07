@@ -2266,10 +2266,27 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                        "fixed": s["fixed"], "disc": s["disc"], "sec": round(secs.get(i + 1, 0), 1),
                        "lo": char_range(secs.get(i + 1, 0), cps)[0],
                        "hi": char_range(secs.get(i + 1, 0), cps)[1]} for i, s in enumerate(sl)]
+        if deck:                                  # 解说词按 deck 的页出（拆页后大纲页数会少）
+            try:
+                _sl = load_slides(deck, out)
+                _secs = page_seconds(_sl, (v["minutes"] * 60) if v else sum(
+                    (s.get("sec") or 45) for s in _sl), v["skip"] if v else ())
+                budget = []
+                for _i, _s in enumerate(_sl, 1):
+                    if v and _i in v["skip"]:
+                        continue
+                    _sec = _secs.get(_i, _s.get("sec") or 45)
+                    _lo, _hi = char_range(_sec, cps, strict=bool(v))
+                    budget.append({"n": _i, "title": _s["title"], "kind": "", "weight": None,
+                                   "fixed": None, "disc": bool(_s.get("disc")),
+                                   "sec": round(_sec, 1), "lo": _lo, "hi": _hi})
+            except Exception as e:
+                print(f"⚠ 用 deck 生成解说词预算失败（{type(e).__name__}），退回大纲预算")
+
         state.clear()
         state.update({
             "name": Path(deck).stem if deck else tgt.stem, "target": str(tgt), "version": version,
-            "bind": f"{host}:{port}", "outline": o, "outline_md": parsed,
+            "bind": f"{host}:{port}", "gate": gate, "outline": o, "outline_md": parsed,
             "outline_md_text": omd.read_text(encoding="utf-8") if omd else None,
             "outline_md_path": str(omd) if omd else None, "minutes": mins, "budget": budget,
             "slides": slides_of(), "narration": narration_of(budget),
