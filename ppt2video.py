@@ -33,6 +33,7 @@
 """
 import argparse, asyncio, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, time, wave
 import urllib.request
+from html import escape as _esc
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -57,10 +58,10 @@ DISC_WORDS = r"不构成.{0,8}(承诺|建议)|以正式披露为准|免责声明
 # deck 不要加免责页，解说词也不得出现任何免责/声明/风险提示类内容。
 DISCLAIMER_ON = False
 NO_DISC_RULE = "本页不要出现任何免责、声明、承诺、风险提示类的语句，也不要写这类内容的变体。"
-OPENERS = ["首先", "其次", "最后", "那么"]   # 只查句首（避免误伤"最后一公里""最后阶段"）
+OPENERS = ["首先", "其次", "最后", "那么", "好，", "好的，"]   # 只查句首（避免误伤"最后一公里""最后阶段"）
 # 分类禁用词：键是类别（用于报错），值是词表。按子串匹配。
 BANNED = {
-    "对话与呼语": ["大家", "你会", "你看", "咱们", "我们来看", "好，", "注意，", "说白了", "说穿了"],
+    "对话与呼语": ["大家", "你会", "你看", "咱们", "我们来看", "注意，", "说白了", "说穿了"],
     "标签式套话": ["一句话", "八个字", "核心就", "结论很直接", "先说结论", "简单说", "综上所述", "值得注意的是"],
     "画面指代": ["上一页", "下一页", "这一页", "本页", "这张表", "如图", "左边", "右边", "看到的"],
     "口语俚语": ["干到", "手里的牌", "绑得很死", "难啃", "差远了", "一条龙", "拉远看", "根子", "把椅子"],
@@ -255,6 +256,9 @@ def render(deck, out, n, start):
     from playwright.sync_api import sync_playwright
     d = Path(out, "slides")
     d.mkdir(parents=True, exist_ok=True)
+    for f in d.glob("*.png"):                       # 清掉多余的旧图（页数变少时）
+        if f.stem.isdigit() and int(f.stem) > n:
+            f.unlink()
     uri = Path(deck).as_uri()
     with sync_playwright() as p:
         try:
@@ -778,6 +782,10 @@ _YEAR_ONE = re.compile(r"((?:19|20|21)\d{2})\s*年")
 _YEAR_RANGE = re.compile(r"((?:19|20|21)\d{2})\s*[–\-~～至]\s*((?:19|20|21)\d{2})\s*年")
 _CN2AN_WARNED = False
 _SPEAK_RULES = [
+    # 日期与尺寸要排在通用区间规则之前，否则 2026-10-07 会被当成区间读成"到"
+    (re.compile(r"(?<!\d)((?:19|20|21)\d{2})-(\d{1,2})-(\d{1,2})(?!\d)"),
+     lambda m: f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日"),
+    (re.compile(r"(\d+)\s*[xX×]\s*(\d+)"), r"\1乘\2"),
     (_WAN_RANGE, _wan_range_sub),                       # 金额规则要在通用区间规则之前
     (_WAN_ONE, lambda m: _yi_label(m.group(1)) or m.group(0)),
     (_YEAR_RANGE, lambda m: f"{_digits(m.group(1))}年到{_digits(m.group(2))}年"),
@@ -1521,7 +1529,7 @@ def notes_html(page):
 def deck_section(page):
     """一页大纲 → 一个 <section class="slide"> 骨架。时长用绝对秒（规范 §六）。"""
     sec = f'{page["sec"]:g}' if page["sec"] else "45"
-    body = [f'<section class="slide" data-title="{page["title"]}" data-sec="{sec}">',
+    body = [f'<section class="slide" data-title="{_esc(page["title"], quote=True)}" data-sec="{sec}">',
             f'  <!-- 版式（规范 §一 第 4 步，按它选组件）：{page["layout"] or "（待定）"} -->']
     if page["info"]:
         body.append("  <!-- 信息点（画面上要放的结论与证据，不含来源标注）：")
