@@ -410,11 +410,22 @@ def cmd_import(deck, out):
             old = []
         if len(old) != len(slides):
             print(f"⚠ 页数有变化（{len(old)} → {len(slides)}），已按页码保留旧的 sec / disc / notes，请核对")
-        for s, o in zip(slides, old):
+        by_title = {o.get("title", "").strip(): o for o in old if o.get("title")}
+        hit_title = 0
+        for idx, s in enumerate(slides):
+            o = by_title.get(s["title"].strip())
+            if o is not None:
+                hit_title += 1
+            elif idx < len(old):                       # 标题对不上才退回页码
+                o = old[idx]
+            if not o:
+                continue
             s["sec"], s["disc"] = o.get("sec"), o.get("disc", False)
             s["fixed"] = o.get("fixed")
             if not s["notes"] and o.get("notes"):
                 s["notes"] = o["notes"]
+        print(f"  继承上次改动：按标题命中 {hit_title} 页"
+              + (f"，其余 {len(slides) - hit_title} 页按页码" if hit_title < len(slides) else ""))
     sj.write_text(json.dumps(slides, ensure_ascii=False, indent=2), encoding="utf-8")
     empty = [i for i, s in enumerate(slides, 1) if not s["text"]]
     noted = sum(bool(s["notes"]) for s in slides)
@@ -535,15 +546,15 @@ class QwenTTS:
                 sys.exit(f"参考音频不存在：{self.ref_audio}")
             self.kw = {"ref_audio": self.ref_audio, "ref_text": self.ref_text,
                        "lang_code": "Chinese"}
-            # 克隆路径也把 instruct 传下去（_generate_icl 签名里没有它，
-            # 但 generate() 会按是否给了 instruct 选择内部路径 —— 实测才知道生不生效）
+            # 克隆模式**忽略 instruct**：克隆走 batch_generate，它只收复数 instructs，
+            # 传单数会 ValueError（然后整批退回逐句，白白变慢）。要调语气请换参考录音。
             if cfg.get("instruct"):
-                self.kw["instruct"] = cfg["instruct"]
+                print(f"⚠ 克隆模式不支持 instruct，已忽略：{str(cfg['instruct'])[:40]}"
+                      "（语气由参考录音决定）")
             # 缓存键带参考音频**内容**哈希：换参考音频（哪怕同名覆盖）才会重建缓存，
             # 否则旧音频的缓存会被错误复用。
             self.key = ["qwen-clone", cfg["qwen_model"], self.ref_audio,
-                        _file_hash(self.ref_audio), self.ref_text,
-                        cfg.get("instruct", "")]
+                        _file_hash(self.ref_audio), self.ref_text]
         else:
             self.kw = {"speaker": cfg["speaker"], "language": "Chinese"}
             if cfg.get("instruct"):
@@ -765,6 +776,7 @@ _D = "零一二三四五六七八九"
 _digits = lambda s: "".join(_D[int(c)] for c in s)
 _YEAR_ONE = re.compile(r"((?:19|20|21)\d{2})\s*年")
 _YEAR_RANGE = re.compile(r"((?:19|20|21)\d{2})\s*[–\-~～至]\s*((?:19|20|21)\d{2})\s*年")
+_CN2AN_WARNED = False
 _SPEAK_RULES = [
     (_WAN_RANGE, _wan_range_sub),                       # 金额规则要在通用区间规则之前
     (_WAN_ONE, lambda m: _yi_label(m.group(1)) or m.group(0)),
@@ -790,7 +802,11 @@ def speak(text):
         import cn2an
         return cn2an.transform(text, "an2cn")
     except Exception as e:
-        print(f"    ⚠ cn2an 转换失败（{type(e).__name__}），用原文：{text[:20]}…")
+        global _CN2AN_WARNED
+        if not _CN2AN_WARNED:                # 只报一次，否则每句数字都刷屏
+            _CN2AN_WARNED = True
+            print("    ⚠ 本机没装 cn2an：数字不做中文读法转换（保留阿拉伯数字）。"
+                  "出片机上装了就没问题。")
         return text
 
 
@@ -820,6 +836,8 @@ def cmd_check():
     row(importlib.util.find_spec("mlx_audio") is not None, "mlx-audio", "pip install mlx-audio", False)
     row(importlib.util.find_spec("edge_tts") is not None, "edge-tts", "pip install edge-tts", False)
     row(importlib.util.find_spec("numpy") is not None, "numpy", "pip install numpy")
+    row(importlib.util.find_spec("cn2an") is not None, "cn2an（数字中文读法）",
+        "pip install cn2an —— 只在**出片机**上必需；缺了 TTS 会把数字念成阿拉伯数字", False)
     # ★ 导入 PPTX/PDF 才需要（HTML 流程不依赖）
     row(importlib.util.find_spec("fitz") is not None, "pymupdf（PPTX/PDF 导入）",
         "pip install pymupdf", required=False)
@@ -1236,7 +1254,16 @@ def cmd_review(deck, out, slides, reset, start, v=None):
         return
     nj = tdir / "narrations.json"
     narr = json.loads(nj.read_text(encoding="utf-8")) if nj.exists() else {}
-    write_review(rv, slides, narr, DEFAULTS, skip=(v["skip"] if v else ()),
+    # 保住手改过的配置：--reset 只重建正文，不能把 review.md 里的
+    # ref_audio / ref_text / speed / backend 冲掉（否则 build 会悄悄换成预置音色）
+    cfg = dict(DEFAULTS)
+    if rv.exists():
+        try:
+            cfg = parse_review(rv)[0]
+            print("  已保留 review.md 里改过的配置")
+        except Exception as e:
+            print(f"  ⚠ 读不出旧 review.md 的配置（{type(e).__name__}），用默认值")
+    write_review(rv, slides, narr, cfg, skip=(v["skip"] if v else ()),
                  slides_dir=Path(out, "slides"))
     print(f"已生成 {rv}，修改确认后运行 build")
 
