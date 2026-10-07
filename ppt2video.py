@@ -1806,6 +1806,25 @@ def outline_md_budget(parsed, cps=None):
     return out, cps, minutes
 
 
+# 页型判断启发式（**这是我加的，规范没定义页型字段**）：
+# 先看「版式」里的模板名（（模板 cover.html）这类），再看标题/版式里的词，
+# 最后按规范结构把首页当封面、末页当结尾。
+NON_CONTENT_TPL = {"cover", "toc", "divider", "section-divider", "section",
+                   "end", "ending", "thanks", "closing", "cta", "back"}
+
+
+def is_non_content(p, idx=None, total=None):
+    blob = f"{p['title']} {p['layout']}"
+    m = re.search(r"模板\s*([A-Za-z0-9._-]+)", blob)
+    tpl = (m.group(1) if m else "").lower()
+    tpl = re.sub(r"\.html?$", "", tpl)
+    if tpl in NON_CONTENT_TPL or any(k in blob for k in NON_CONTENT):
+        return True
+    if idx is not None and total and (idx == 0 or idx == total - 1):
+        return True
+    return False
+
+
 def outline_preflight(parsed, src_text=None):
     """Gate 1 预检。**注意：规范没有要求这套自动检查，这是我加的便利校验**
     （规范只定义了格式与密度规则）。级别：ERROR 必须改，WARN 请人确认。"""
@@ -1829,9 +1848,9 @@ def outline_preflight(parsed, src_text=None):
         if abs(total - want) > want * 0.05:
             add("WARN", f"各页时长合计 {total:.0f} 秒，与目标 {want:.0f} 秒差 {total - want:+.0f} 秒（规范 §一：相加应约等于总时长）")
     src_nums = set(re.findall(r"\d[\d,]*(?:\.\d+)?", src_text)) if src_text else None
-    for p in pages:
+    for i, p in enumerate(pages):
         n, t = p["n"], p["title"]
-        non_content = any(k in t for k in NON_CONTENT) or any(k in p["layout"] for k in NON_CONTENT)
+        non_content = is_non_content(p, i, len(pages))
         if len(t) > 30:
             add("WARN", f"标题 {len(t)} 字 > 30（规范 §一 第 14 行：≤30 字一行）", n)
         if not p["layout"]:
@@ -1843,6 +1862,8 @@ def outline_preflight(parsed, src_text=None):
                     f"信息点 {cnt} 个（规范 §二 第 41 行：内容页 6–10，>10 必须拆页）", n)
             if p["info_declared"] is not None and p["info"] and p["info_declared"] != len(p["info"]):
                 add("ERROR", f"『信息点（{p['info_declared']}）』与实际 {len(p['info'])} 条不符", n)
+        if not non_content and p["sec"] and not (40 <= p["sec"] <= 60):
+            add("WARN", f"内容页 {p['sec']:.0f} 秒，规范 §一 第 11 行参考 40–60 秒", n)
         k = len(p["notes"])
         if not 3 <= k <= 5:
             add("WARN", f"讲述要点 {k} 条（规范 §一 第 26 行：3–5 条）", n)
@@ -1850,16 +1871,33 @@ def outline_preflight(parsed, src_text=None):
         if no_cite:
             add("WARN", f"{len(no_cite)} 条讲述要点没注明出处（规范 §一 第 26 行要求每条注明）", n)
         blob = "\n".join([t, p["layout"], p["chunk"]])
+        # 剥掉出处标注：`（源文档 免责声明 1）` 是在引用源文档的小节名，不是本页写了免责
+        blob = re.sub(r"[（(][^）)]{0,40}(?:源文档|§|第\s*\d)[^）)]{0,40}[）)]", " ", blob)
         if re.search(r"免责|不构成.{0,8}(承诺|建议)|风险提示|声明.{0,4}性质", blob):
             add("ERROR", "出现免责/声明类内容（owner 要求默认不加）", n)
         if src_nums is not None:
             blob = "\n".join([t] + p["info"])
             blob = re.sub(r"[（(]\s*占\s*\d+\s*行\s*[)）]", "", blob)     # 计数标注不算数字
+            blob = re.sub(r"序号\s*\d+", " ", blob)                        # 章节序号不是数据
             blob = RE_CITE.sub("", blob)
             miss = [x for x in set(re.findall(r"\d[\d,]*(?:\.\d+)?", blob))
                     if x not in src_nums and x.replace(",", "") not in src_nums]
             if miss:
                 add("WARN", f"这些数字没在源文档里逐字查到：{', '.join(miss[:6])}", n)
+    # 每章内容页数（规范 §一 第 13 行：[章节页 → 2–4 个内容页] × N）
+    seg, segs = [], []
+    for idx, pg in enumerate(pages):
+        if is_non_content(pg, idx, len(pages)):
+            if seg:
+                segs.append(seg)
+            seg = []
+        else:
+            seg.append(pg["n"])
+    if seg:
+        segs.append(seg)
+    for s in segs:
+        if not 2 <= len(s) <= 4:
+            add("WARN", f"本章 {len(s)} 个内容页（规范 §一 第 13 行参考 2–4 个），页 {s[0]}–{s[-1]}", s[0])
     return issues
 
 
