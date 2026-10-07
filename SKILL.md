@@ -151,8 +151,8 @@ $PY ~/ppt2video.py narrate deck/index.html --source 原文.md --brief deck/brief
 `review.md` 顶部是 **YAML 配置块，这才是配置的真源**（改脚本里的 `DEFAULTS` 会被它覆盖）：
 
 ```yaml
-ref_audio: /Users/<user>/voice.wav     # 参考录音（克隆音色）
-ref_text: 嗯，大家好，…                  # 必须与录音一字不差
+ref_audio: <参考录音的绝对路径>     # 参考录音（克隆音色）
+ref_text: <参考录音的逐字文本>                  # 必须与录音一字不差
 instruct:                                # ⚠️ 克隆模式下无效，见「坑」
 speed: 1.15                              # ✅ 基线（ffmpeg atempo 后处理）
 subtitles: burn                          # burn 烧录 / soft 软字幕 / off

@@ -109,31 +109,14 @@ FFMPEG = resolve_ffmpeg()
 # PPTX 没有同名 PDF 时的兜底转换器。字体/特效可能与原稿有差异，见 SKILL.md「还原度」。
 SOFFICE = os.environ.get("SOFFICE", "/Applications/LibreOffice.app/Contents/MacOS/soffice")
 
-# ─── 默认配置 ────────────────────────────────────────────
-# 注意：qwen_model 必须是**本地绝对路径**——用 HF 仓库 ID 会触发联网下载，而 HF 被墙。
-DEFAULTS = {
-    "backend": "qwen",            # qwen / edge
-    "qwen_model": "/Users/<user>/models/<qwen-tts-8bit>",
-    # —— 克隆模式（backend=qwen 且填了 ref_audio 时启用）——
-    "ref_audio": "/Users/<user>/voice.wav",
-    "ref_text": "嗯，大家好，嗯，我是<姓名>，我是广东某 OLED 材料公司光电材料有限公司的负责人。今天由我向大家介绍一下我们公司的一些基本情况。嗯，如果有问题，请随时提问，谢谢。",
-    # —— 预置音色模式（ref_audio 为空时启用）——
-    "speaker": "Vivian",          # Vivian / Serena / Uncle_Fu / Dylan / Eric
-    "instruct": "",
-    # —— edge-tts 备用 ——
-    "edge_voice": "zh-CN-YunxiNeural",
-    "edge_rate": "+5%",
-    "subtitles": "burn",          # burn（烧录）/ soft（软字幕）/ off
-    "speed": 1.15,                # 变速（ffmpeg atempo，不变调）。模型自带的 speed 参数在克隆模式下无效，只能后处理
-    # —— 画面构图（导入的旧 PPTX/PDF 没有预留字幕区时用 letterbox）——
-    "frame": "fit",               # fit：铺满画面，居中留边；letterbox：画面上移，底部留 120px 给字幕
-    "pad_color": "black",         # 留边颜色，可写成与幻灯片底色一致，如 0x0B1F3A
-}
-
-# LLM / 文档解析端点**不写进仓库**（本仓库是公开的）。
-# 优先级：环境变量 > 本地配置 ~/.config/mhpvs/local.json > 空。
-#   本地配置示例：{"llm_base": "http://your-gateway:9000/v1", "llm_model": "main",
-#                  "docreader": "http://your-docreader:50052"}
+# ─── 本地配置（**不入库**）─────────────────────────────────
+# 凡是跟这台机器/这个人相关的东西都走这里，仓库里只留空值与占位符：
+# 端点、密钥、TTS 模型路径、参考录音及其文字。
+# 优先级：环境变量 > ~/.config/mhpvs/local.json > 空
+#   示例：{"llm_base": "http://<网关>:9000/v1", "llm_model": "main",
+#          "docreader": "http://<解析服务>:50052",
+#          "qwen_model": "/abs/path/Qwen3-TTS-...-8bit",
+#          "ref_audio": "/abs/path/voice.wav", "ref_text": "参考录音的逐字文本"}
 LOCAL_CONF = Path(os.environ.get("MHPVS_CONF", "~/.config/mhpvs/local.json")).expanduser()
 
 
@@ -147,6 +130,27 @@ def local_conf():
 _CONF = local_conf()
 DEFAULT_LLM_BASE = os.environ.get("LLM_BASE_URL") or _CONF.get("llm_base", "")
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL") or _CONF.get("llm_model", "main")
+
+# ─── 默认配置 ────────────────────────────────────────────
+# 注意：qwen_model 必须是**本地绝对路径**——用 HF 仓库 ID 会触发联网下载，而 HF 被墙。
+DEFAULTS = {
+    "backend": "qwen",            # qwen / edge
+    "qwen_model": os.environ.get("QWEN_MODEL") or _CONF.get("qwen_model", ""),
+    # —— 克隆模式（backend=qwen 且填了 ref_audio 时启用）——
+    "ref_audio": os.environ.get("REF_AUDIO") or _CONF.get("ref_audio", ""),
+    "ref_text": os.environ.get("REF_TEXT") or _CONF.get("ref_text", ""),
+    # —— 预置音色模式（ref_audio 为空时启用）——
+    "speaker": "Vivian",          # Vivian / Serena / Uncle_Fu / Dylan / Eric
+    "instruct": "",
+    # —— edge-tts 备用 ——
+    "edge_voice": "zh-CN-YunxiNeural",
+    "edge_rate": "+5%",
+    "subtitles": "burn",          # burn（烧录）/ soft（软字幕）/ off
+    "speed": 1.15,                # 变速（ffmpeg atempo，不变调）。模型自带的 speed 参数在克隆模式下无效，只能后处理
+    # —— 画面构图（导入的旧 PPTX/PDF 没有预留字幕区时用 letterbox）——
+    "frame": "fit",               # fit：铺满画面，居中留边；letterbox：画面上移，底部留 120px 给字幕
+    "pad_color": "black",         # 留边颜色，可写成与幻灯片底色一致，如 0x0B1F3A
+}
 
 SOURCE_MAX = int(os.environ.get("SOURCE_MAX_CHARS", "60000"))
 

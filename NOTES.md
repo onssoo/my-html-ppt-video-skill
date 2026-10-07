@@ -105,7 +105,7 @@
 
 | 项 | 结果 |
 |---|---|
-| 克隆分支 | `配音模式: 克隆 /Users/<user>/voice.wav`，真加载 `Qwen3-TTS-12Hz-1.7B-Base-8bit` |
+| 克隆分支 | `配音模式: 克隆 <参考录音的绝对路径>`，真加载 `Qwen3-TTS-12Hz-1.7B-Base-8bit` |
 | `batch()` | 正常；edge 那个"退回逐句"的噪音在 qwen 下**不存在** |
 | 烧字幕 | `has_libass: True`（imageio-ffmpeg 7.1），成片无"改为软字幕"降级；抽帧可见字幕烧进画面 |
 | 版本分配 | 目标 **12s / 32s / 16s**（fixed 12 + 权重 60/30，总 60s），合计正好 60s |
