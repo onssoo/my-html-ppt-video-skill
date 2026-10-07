@@ -2543,6 +2543,9 @@ def main():
         if not a.deck:
             ap.error("review-ui 需要 outline.json 或 deck 路径")
         return cmd_review_ui(a.deck, a.version, a.host, a.port, a.gate, not a.no_open)
+    if a.cmd == "gates" and not a.deck:      # 不给 deck 就报当前目录的状态
+        return cmd_gates(Path("."), None)
+
     if not a.deck:
         ap.error("需要指定幻灯片文件（HTML / PPTX / PDF）")
     deck = str(Path(a.deck).resolve())
