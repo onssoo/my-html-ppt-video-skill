@@ -68,6 +68,8 @@ $PY $P2V review-doc deck/index.html                   # 解说词审定稿
 $PY $P2V review-ui  deck/index.html                   # 审核台（本机起，点"完成"退出）
 ```
 - `review.md` 顶部的 YAML 是**配置真源**（`ref_audio` / `speed` / `subtitles`…）；每页 `# N · 标题` + checkbox + 图片 + 代码块里的解说词，勾 `[x]` 跳过该页
+- ⚠ **deck 项目若纳入 git**：`review.md` 里有参考录音路径与逐字文本，`video-output/` 要加进 `.gitignore`
+  （本仓库的 `.gitignore` 已忽略 `video-output/` 与 `*-video/`，deck 项目要自己加）
 - `data-sec="45"` = 本页解说词的**目标秒数**（绝对秒，不是权重）；`<div class="notes">` = 讲述要点，也是数字溯源依据
 - **免责默认关闭**：deck 不做免责页，解说词也不写免责/声明/风险提示；只有 owner 明确要求才用 `--disclaimer`
 - **停下来 → Gate ②**：owner 看画面 + 解说词
