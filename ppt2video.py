@@ -2420,8 +2420,12 @@ def capacity_issues(page):
         over = [(len(c), c) for r in rows for c in r if len(c) > 12]
         if over:
             n, longest = max(over)
-            out.append(("WARN", f"{len(over)} 个格超过「每格约 12 字」（最长 {n} 字：{longest[:16]}…）"
-                                "—— 做 slides 时会被精简，建议直接在大纲里改短"))
+            cpl = max(7, int((1728 / max(ncol, 1) - 44) / 32))     # 实测标定：一行能放多少字
+            lines_ok = 3 if len(rows) <= 3 else (2 if len(rows) == 4 else 1)
+            out.append(("WARN", f"{len(over)} 个格超过容量（最长 {n} 字：{longest[:16]}…）："
+                                f"{ncol} 列 × {len(rows)} 行时每格约 {cpl * lines_ok} 字"
+                                f"（一行 {cpl} 字 × {lines_ok} 行）—— 做 slides 时会被精简，"
+                                "建议直接在大纲里改短，或按规范 §三 第 62 行换版式/拆页"))
         if caps and sum(len(c) for c in caps) > 60:
             out.append(("WARN", f"图注合计 {sum(len(c) for c in caps)} 字 > 一行约 60 字"
                                 "—— 画面上只放一行，建议精简或合并"))
