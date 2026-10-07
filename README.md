@@ -20,7 +20,7 @@
 
 | 必需 | 说明 |
 |---|---|
-| Python 3.10+ | 本仓库只依赖标准库 + `numpy` |
+| Python 3.10+ | 脚本只用标准库 + `numpy`；截图/克隆音色另有依赖，见下表 |
 | ffmpeg | 用 `imageio-ffmpeg` 自带的静态二进制即可（**自带 libass**，可烧字幕），不需要 ffprobe |
 | Playwright Chromium | 逐页截图（`check_deck.py` 用同一引擎，保证检查通过的画面 = 截图画面）|
 | mlx-audio + Qwen3-TTS | 克隆音色（Apple Silicon）|
@@ -74,7 +74,7 @@ LLM 端点、文档解析服务、TTS 模型路径、参考录音都从**本地�
 ## 规范血缘
 
 - **流程与密度规则**从属于《商务演示文稿制作规范》（`business-deck-spec.md`）：大纲格式、信息点 6–10、字号、逐字稿生成原则。
-- **版式骨架**来自配套的 `html-ppt-skill` 仓库（它自己的 配套仓库 `html-ppt-skill` 的 `references/layouts.md` 列出全部骨架）。
+- **版式骨架**来自配套仓库 `html-ppt-skill` 的 `references/layouts.md`（36 个骨架模板）。
 - 与上游原版的差异见 `UPSTREAM.md`。
 
 ## 仓库结构
@@ -104,4 +104,4 @@ python -m pytest tests/ -q          # 确定性逻辑，不碰 TTS / LLM / 浏�
 
 ## 许可
 
-MIT。上游 `juguang/html-ppt-video-skill`（Copyright (c) 2026 spark）原样保留在 `upstream/`；本地化改造部分见 `LICENSE`。
+MIT。根目录 `LICENSE` 保留上游 `juguang/html-ppt-video-skill` 的版权行（Copyright (c) 2026 spark），并加了本地化改造的版权行；上游原版代码留作对照，在 `upstream/`。

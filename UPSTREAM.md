@@ -23,7 +23,7 @@
 
 ## 实测依据
 
-所有改动都有实测数字记录在 `SKILL.md` 的「Critical Pitfalls」里（字号、时长、相似度、坑的复现方法）。
+所有改动都有实测数字记录在 `SKILL.md` 的「`references/pitfalls.md`」里（字号、时长、相似度、坑的复现方法）。
 
 ---
 
@@ -35,11 +35,11 @@
 | 2 | 手工确认页数 | 自动识别 `<section class="slide">` | 减少一步人工 |
 | 3 | edge-tts（在线）| **mlx-audio Qwen3-TTS 克隆**（edge-tts 保留为备选）| 要克隆本人音色；且不依赖在线服务 |
 | 4 | 按页估算字幕时间 | **按句合成，起止=真实音频时长** | 字幕精度 |
-| 5 | 逐页 mp4 片段 + concat | **一次音轨 + 一次视频** | 上游"Critical Pitfalls"自己写的 `-shortest` 漂移问题，从结构上根除 |
+| 5 | 逐页 mp4 片段 + concat | **一次音轨 + 一次视频** | 上游"`references/pitfalls.md`"自己写的 `-shortest` 漂移问题，从结构上根除 |
 | 6 | 无缓存 | **句子级 TTS 缓存** | 改一页只重合成改动那几句 |
 | 7 | 解说词靠 agent 手写 | **`narrate` 直连 DGX infersight，逐页生成 + lint 自动重写** | 不需要 agent 框架；杜绝电报体碎句 |
 | 8 | brew ffmpeg + ffprobe | `imageio-ffmpeg` 静态二进制（自带 libass）| M2 没 brew；且不需要 ffprobe（时长用 Python 的 wave 读）|
-| 9 | Noto Sans SC | PingFang SC（macOS 自带）| 不额外装字体 |
+| 9 | Noto Sans SC | Noto Sans SC（macOS 自带）| 不额外装字体 |
 | 10 | 4 个 edge-tts 音色 | **克隆本人音色** + 上述三项调参 | — |
 | 11 | 无 `-t` 兜底 | mux 加 `-t <总时长>` | 修 ffconcat 末帧播两遍 |
 | 12 | 无时长合理性检查 | 按字数判定（0.16~0.50 s/字），异常重试并逐次加大重复惩罚 | 防翻车 |

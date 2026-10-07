@@ -16,7 +16,7 @@
   4. 逐页 mp4 片段 + concat，上游自己的文档就写了 -shortest 会漂移
   5. 字幕按页估算时长，精度不足
 
-本地版实测记录见 SKILL.md「Critical Pitfalls」（每条都有具体数字）。
+本地版实测记录见 `references/pitfalls.md`（每条都有具体数字）。
 
 解说词规范（references/narration-spec.md）要点：
   - 正式口头陈述，不是聊天：严谨/正向/自信/适度激情

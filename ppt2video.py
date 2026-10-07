@@ -2,7 +2,7 @@
 """ppt2video.py — HTML 幻灯片 → 配音讲解视频（M2 本地实况适配版）
 
 适配的实际情况（2026-10-06 实测）：
-  · M2 没装 Chrome，但装了 Microsoft Edge（Chromium 内核，--headless 参数通用）
+  · 截图走 Playwright Chromium（`render()`）；没有 Playwright 才回退本机 Edge/Chrome
   · M2 没装 brew，但 pip 的 imageio-ffmpeg 带静态 ffmpeg 7.1 且**支持 libass**（可烧录字幕）
   · mlx-audio 的克隆接口是 Model.generate(ref_audio=, ref_text=)，**没有 generate_voice_clone**
   · HF 直连被墙 → 模型必须用**本地绝对路径**，不能用 HF 仓库 ID
@@ -10,7 +10,7 @@
 
 用法（HTML 输入）：
   python ppt2video.py check
-  python ppt2video.py narrate deck/index.html     # 调 DGX infersight 写解说词
+  python ppt2video.py narrate deck/index.html     # 调 LLM 端点写解说词（端点见 local.json）
   python ppt2video.py review  deck/index.html     # 截图 + 生成 review.md
   python ppt2video.py build   deck/index.html     # 配音 + 字幕 + 合成视频
 

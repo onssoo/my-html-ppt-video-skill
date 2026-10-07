@@ -40,6 +40,47 @@ description: Use when converting a document, article, or existing slide deck int
 
 先选路线（见上表）。**路线 B 跳过下面的 Phase 1，直接从 Phase 2.5 开始。**
 
+### 路线 A：文档 → 大纲 → slides → 解说词 → 成片
+
+**Phase 1 · 大纲（→ Gate ①）**
+
+1. 按 **`business-deck-spec.md` §一** 定场景：受众 / 用途 / 时长 / 主线，同时写 `brief.md`
+2. 写 `大纲.md`，格式按 `references/outline-schema.md`：
+   `## P1 结论式标题` + `- 版式：` + `- 信息点（N）：` + `- 时长：45 秒` + `- 讲述要点（3–5 条，每条注明出处）`
+3. `python ppt2video.py outline 大纲.md` → `大纲-审核报告.md`（按规范 §一/§二 预检 + 人工审核要点）。**ERROR 必须清零**
+4. **停下来 → Gate ①**：owner 在审核台逐页改，或直接改 `大纲.md`
+
+**Phase 2 · 做 slides**
+
+1. `python ppt2video.py deck-skeleton 大纲.md` → `deck-骨架.html`
+   （每页一个 `<section class="slide" data-title="…" data-sec="45">` + 隐藏的 `<div class="notes">`）
+2. 版式从 `html-ppt-skill/references/layouts.md` 的骨架里选；模板 `dailei-business-deck`、主题 `dailei-business-navy`
+3. `check_deck.py deck/index.html --footer ".bd-foot" --fonts "Noto Serif SC,Noto Sans SC,Inter"`
+   （规范 §七：逐页几何 / 字号 / 填充率 / 外链 / 字体加载）—— **ERROR 清零**，再人工看一遍
+
+**Phase 3 · 解说词（→ Gate ②）**
+
+```bash
+$PY $P2V review deck/index.html                       # 截图 + 生成 review.md
+$PY $P2V narrate deck/index.html --source 原文.md --brief brief.md
+$PY $P2V deck-pdf   deck/index.html                   # 画面预览 PDF
+$PY $P2V review-doc deck/index.html                   # 解说词审定稿
+$PY $P2V review-ui  deck/index.html                   # 审核台（本机起，点"完成"退出）
+```
+- `review.md` 顶部的 YAML 是**配置真源**（`ref_audio` / `speed` / `subtitles`…）；每页 `# N · 标题` + checkbox + 图片 + 代码块里的解说词，勾 `[x]` 跳过该页
+- `data-sec="45"` = 本页解说词的**目标秒数**（绝对秒，不是权重）；`<div class="notes">` = 讲述要点，也是数字溯源依据
+- **免责默认关闭**：deck 不做免责页，解说词也不写免责/声明/风险提示；只有 owner 明确要求才用 `--disclaimer`
+- **停下来 → Gate ②**：owner 看画面 + 解说词
+
+**Phase 4 · 出片（→ Gate ③）**
+
+```bash
+$PY $P2V build deck/index.html        # 一页句子一次 batch；字幕起止 = 真实音频时长
+$PY $P2V qc    deck/index.html        # 质检报告：时长偏差 / 逐页对比 / 音量 / 字幕抽样 / 重录表
+```
+- 出片前会查 `gates.json`：deck / 解说词 / review.md 在通过 Gate ② 之后被改过 → **拒绝出片**
+- **停下来 → Gate ③**：owner 听音色与读音、看字幕遮挡；读错字加进 `pronounce.json` 再重跑
+
 ### 路线 B: 已有 PPTX / PDF → import
 
 命令是 `ppt2video.py import <文件>`，细节见 **`references/route-b-import.md`**
@@ -51,34 +92,30 @@ description: Use when converting a document, article, or existing slide deck int
 
 | Gate | 什么时候 | 命令 | 产物 | owner 能改什么 |
 |---|---|---|---|---|
-| **1 大纲** | 读完源文档、**还没写 deck** 之前 | `outline 大纲.md` | `大纲-审核报告.md`：总览 + 逐页问题 + **时长与字数预算表** | `outline.json`：增删页、调顺序、改权重、改总时长、改受众与风格 |
+| **1 大纲** | 读完源文档、**还没写 deck** 之前 | `outline 大纲.md` | `大纲-审核报告.md`：按规范 §一/§二 预检 + 人工审核要点 | **`大纲.md` 本身**：增删页、改标题、改版式、改信息点、改时长 |
 | **2 画面 + 解说词** | deck 写完、解说词写完 | `deck-pdf <deck>` 和 `review-doc <deck> --version v` | `<deck>-预览.pdf`（像 PPT 一样翻）、`解说词审定稿-<版本>.md`（画面要点 / 讲述要点降序 / 解说词 / 字数 vs 目标 / lint） | deck 任意；解说词逐页文本 |
 | **3 成片** | `build` 出片之后 | `qc <deck> --version v` | `质检报告.md`：实测时长与偏差、**逐页目标 vs 实际**、偏短页、音量、字幕抽样、重录勾选表 | 勾 `重录` 列标记要重录的页；调 `speed`、换参考录音 |
 
 - **Gate 1 是事前审**：大纲没过就不要写 deck。事后补的大纲救不了结构错误。
 - **Gate 2 里 deck 一改，必须重跑 `review`**：画面文字变了，解说词的数字溯源依据也跟着变。
 - **Gate 3 的 `qc` 不依赖 ffprobe**：总时长读 `narration.wav`，逐页时长读 `list.ffconcat`。
-- `outline.json` 的 schema：
-  ```json
-  {"project": "…", "audience": "…", "minutes": 14, "style": "…", "source": "…",
-   "pages": [{"title": "…", "kind": "cover|toc|section|content|data|closing",
-              "weight": 60, "fixed": null, "disc": false,
-              "points": ["画面要点…"], "notes": ["讲述要点，降序…"]}]}
-  ```
-  权重是**相对权重**；`fixed` 是固定秒数（不参与缩放，封面/目录/结尾用）。
+- **怎么算「通过」**：owner 在审核台点「完成」时写入 `gates.json`（记录当时各文件的哈希）；
+  或用 `python ppt2video.py gates <deck>` 查看状态（哪一道门、什么时候通过、之后哪些文件被改过）。
+- **`build` 的硬规则**：`gates.json` 里没有 Gate ② 记录、或 deck / 解说词 / review.md 在通过之后被改过
+  → **拒绝出片**。**agent 不得自行加 `--force`**；只有 owner 明确说「我知道，照出」才能用。
 
 ### 审核台（`review-ui`）
 
 ```bash
 python ppt2video.py review-ui deck/index.html --version investor-14   # 四个 tab 都能用
-python ppt2video.py review-ui outline.json                            # 只审大纲
+python ppt2video.py review-ui 大纲.md                                  # 只审大纲
 ```
 
 - **由 skill 在到达审核点时按需拉起**，不是常驻服务：在本机起 HTTP 服务，**前台阻塞到 owner 点「完成」**，然后写 `review-log.json`（时间 + 改了什么）并自动关闭。
 - 默认只绑 `127.0.0.1`（同机自动开浏览器）；`--host <tailnet IP>` 可让别的机器也能开，`--no-open` 关掉自动开浏览器。
 - 四个 tab：① 大纲 ② 画面 ③ 解说词 ④ 成片——**哪个有数据哪个可点**。
-- **只读展示 + 白名单写回**：能改的只有 `outline.json` 的字段、`narrations.json` 的逐页文本、`redo.json` 的重录标记。不跑 pipeline、不调 LLM。
-- 保存大纲前把上一版留成 `outline.json.bak`；保存解说词时**当场重跑 lint**（字数区间、套话、画面指代、数字溯源）并把问题标出来。
+- **只读展示 + 白名单写回**：能改的只有 `大纲.md`（逐页 md 片段）、`narrations.json` 的逐页文本、`redo.json` 的重录标记。不跑 pipeline、不调 LLM。
+- 保存 `大纲.md` 前把上一版留成 `.bak`；保存解说词时**当场重跑 lint**，并**同步写回 `review.md`**（build 读的是它）。
 - 成片区用 **Range 请求**提供视频（进度条能拖），旁边就是逐页"目标 vs 实际"和重录勾选表。
 
 ## 多版本：同一份幻灯片，不同时长
@@ -146,37 +183,6 @@ python ppt2video.py review-ui outline.json                            # 只审�
 参考录音要求：**3~10 秒、内容连贯（不要几段不相干的话）、包含会用到的词（尤其数字）、
 无"嗯"等口头语、语速平稳、安静环境一条到底**。
 （实测：参考文本里含"大家好"时，合成"大家好"相似度 0.9647；不含时只有 0.9318。）
-
-## Troubleshooting
-
-| 现象 | 原因 | 解决 |
-|---|---|---|
-| `Config not found` | 下的是官方 PyTorch 版（只有 config.yaml）| 换 `mlx-community/*` 的 MLX 版 |
-| HF 连接超时 | 用了 HF 仓库 ID | 改成本地绝对路径 |
-| `does not support instructs` | 克隆模式不支持 instruct | 去掉 instruct，改用参考录音控制语气 |
-| 某句音色突然不像 | 该句过短（<1 秒）| 正常现象；可把该句写长一点 |
-| 视频比日志长一页 | ffconcat 末帧缺 duration | 已有 `-t` 兜底；若仍出现检查 `total` 计算 |
-| 截图全是同一页 | deck 不支持 `#/N` 翻页 | reveal.js 用 `--hash-start 0` |
-| 改了配置没生效 | `review.md` 覆盖了 DEFAULTS | 直接改 `review.md`，或 `review --reset` |
-| 字幕是方块 | 字体缺失 | 本版用 PingFang SC；换机器需确认系统有中文字体 |
-| 数字读法不对（40%→四零）| 没过 `speak()` | 确认 build 走了 `speak()`；单位规则用 `(?![A-Za-z])` 前瞻 |
-| 专有名词读错（Pt/Au）| 缺读音覆盖 | 在 `video-output/pronounce.json` 加 `{"Pt":"铂"}` |
-| 解说词出现套话/问句 | LLM 没遵守规范 | `narrate` 的 lint 会自动重写；仍出现则调 `references/narration-spec.md` 措辞 |
-| 数字对不上画面 | 模型幻觉 | 确认 `--source` 传了原文；数字溯源会退回重写 |
-| 导入报"页数与 PDF 对不上" | PPTX 有隐藏页，或同名 PDF 是旧版本 | 用 PowerPoint 自己导出 PDF；或用 `SOFFICE` 指定别的转换器 |
-| 截图里字体变了 / 元素错位 | LibreOffice 转换的字体替换与特效丢失 | 自己导出同名 PDF 放在 PPTX 旁边 |
-| 分步动画全挤在一页 | PDF 是静态画面，分步出现或消失的元素会叠加 | 导出 PDF 前先把分步内容拆成多页 |
-| 字幕压住画面底部内容 | 旧幻灯片没预留字幕区 | `review.md` 里设 `frame: letterbox` |
-| `import` 报缺 pymupdf / python-pptx | 没装导入依赖 | `pip install pymupdf python-pptx` |
-| 竖版 A4 报告导入后左右大片黑边 | PDF 不是幻灯片版式 | 报告类内容走路线 A 做 HTML PPT |
-| 实际时长和目标差很多 | 语速估算不准，或被 `MIN_SEC` 钳制 | 看 build 打印的"实测字/秒"；先出一次母版校准 `cps.json` |
-| 所有版本的时长都不对 | 改了 `speed` 但没重新校准 | 删掉 `cps.json`，重跑一次母版 |
-| 短版把重要内容删了 | 压缩按讲述要点顺序取舍 | 把那条要点移到该页讲述要点的**第一条** |
-| 某页解说词总因过长被退回重写 | 该页分到的秒数太少 | 调高该页 `sec` 权重，或把它从短版 `skip` 掉 |
-| 母版改了，短版还是旧的 | 短版是母版压缩来的 | narrate 时会按时间提醒；重跑短版的 narrate |
-| 年份念成"二千零二十六年" | 读法规则缺年份条目 | 已内置（`_SPEAK_RULES` 前两条）；若仍出现，检查是否被 `pronounce.json` 覆盖 |
-| build 跑到一半报 TTS 错误 | 网络/推理瞬时抖动（edge 的 `NoAudioReceived`、网关 reset）| 已内置 3 次退避重试；仍失败就重跑，**已合成的句子命中缓存不会重做** |
-| `100000 万元` 念成"十万万元" | 已内置折算：万元 ≥ 10000 自动读成亿元 | 若仍出现，检查数值是否 < 10000 万元，或被 `pronounce.json` 覆盖 |
 
 ## 参考文件
 
