@@ -1350,6 +1350,49 @@ def cmd_build(out, slides, v=None):
 # Gate 2 画面 + 解说词 → 预览 PDF + 解说词审定稿
 # Gate 3 成片 → 质检报告（时长/逐页偏差/字幕/音量/重录表）
 
+# ─── 大纲 → deck 骨架（依据规范 §六 第 84 行）──────────────────
+# 规范原文：「每页的讲述要点原样写入 <div class="notes">，时长写入
+# <section class="slide" data-sec="45">」。这一环我原来完全没有——
+# 它是"依据大纲.md 去做 slides"的接口。（思路吸收自 reviewer 的 outline_md.py）
+
+def notes_html(page):
+    """讲述要点 → <div class="notes">（出处标注保留，它是解说的溯源依据）。"""
+    items = [x.strip() for x in page["notes"]]
+    return '<div class="notes">\n' + "\n".join(f"{i}. {x}" for i, x in enumerate(items, 1)) + "\n</div>"
+
+
+def deck_section(page):
+    """一页大纲 → 一个 <section class="slide"> 骨架。时长用绝对秒（规范 §六）。"""
+    sec = f'{page["sec"]:g}' if page["sec"] else "45"
+    body = [f'<section class="slide" data-title="{page["title"]}" data-sec="{sec}">',
+            f'  <!-- 版式（规范 §一 第 4 步，按它选组件）：{page["layout"] or "（待定）"} -->']
+    if page["info"]:
+        body.append("  <!-- 信息点（画面上要放的结论与证据，不含来源标注）：")
+        body += [f"       {i}. {x}" for i, x in enumerate(page["info"], 1)]
+        body.append("  -->")
+    body += ["  <!-- TODO: 按上面版式填组件；画面放结论和证据，解释留给 .notes -->",
+             "  " + notes_html(page).replace("\n", "\n  ").rstrip(),
+             "</section>"]
+    return "\n".join(body)
+
+
+def cmd_deck_skeleton(md_path, out_path=None):
+    """把 大纲.md 落成 deck 骨架（每页一个 <section>，含 data-title / data-sec / .notes）。"""
+    p = Path(md_path)
+    if not p.exists():
+        sys.exit(f"没有 {p}")
+    doc = parse_outline_md(p.read_text(encoding="utf-8"))
+    if not doc["pages"]:
+        sys.exit("没解析到页：页标题要写成『## P5 结论式标题』")
+    parts = [deck_section(x) for x in doc["pages"]]
+    dest = Path(out_path) if out_path else p.with_name("deck-骨架.html")
+    dest.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+    print(f"已写入 {dest}：{len(doc['pages'])} 个 <section>"
+          f" · data-sec 合计 {sum(x['sec'] or 45 for x in doc['pages']):.0f} 秒"
+          f" · notes 共 {sum(len(x['notes']) for x in doc['pages'])} 条")
+    return 0
+
+
 def cmd_outline(path, out_path=None):
     """Gate 1：大纲 → 审核报告 + 预检。
 
@@ -2179,7 +2222,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
 
 def main():
     ap = argparse.ArgumentParser(description="幻灯片（HTML / PPTX / PDF）→ 配音讲解视频")
-    ap.add_argument("cmd", choices=["check", "outline", "import", "narrate", "review",
+    ap.add_argument("cmd", choices=["check", "outline", "deck-skeleton", "import", "narrate", "review",
                                     "deck-pdf", "review-doc", "qc", "review-ui", "build"])
     ap.add_argument("deck", nargs="?", help="幻灯片 HTML / PPTX / PDF，或 outline.json")
     ap.add_argument("--out", help="审核产物的输出路径（大纲审定稿 / 预览 PDF / 审定稿 / 质检报告）")
@@ -2213,6 +2256,10 @@ def main():
         if not a.deck:
             ap.error("outline 需要 outline.json 路径")
         return cmd_outline(a.deck, a.out)
+    if a.cmd == "deck-skeleton":               # 大纲 → deck 骨架（规范 §六）
+        if not a.deck:
+            ap.error("deck-skeleton 需要 大纲.md 路径")
+        return cmd_deck_skeleton(a.deck, a.out)
     if a.cmd == "review-ui":                   # 审核台：前台阻塞到 owner 点完成
         if not a.deck:
             ap.error("review-ui 需要 outline.json 或 deck 路径")
