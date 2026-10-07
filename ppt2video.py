@@ -2262,36 +2262,60 @@ def est_lines(text, width_px, font_px, limit=None):
     return min(n, limit) if limit else n
 
 
-def table_height(rows_items, ncol, avail_w=1728):
-    """表格自然高度（实测标定：一行 71px，每多一行 +46.4px；表头 76/123px）。
+def fit_limits(ncol, nrows, avail_w=1728):
+    """每格的**字数上限**与允许行数（实测标定，2026-10-07，30 页真实素材）。
 
-    列宽是浏览器**按内容自动分配**的：先算每列理想宽，总和超画布就按比例压缩，
-    被压到放不下的格才会换行 —— 这是实测（2026-10-07，30 页真实素材）得到的规律，
-    等分列宽的估法会严重高估行数（平均误差 84px → 该模型 ≤ …）。"""
+    横向：列宽 ≈ 1728/ncol − 44px padding，32px 字号 → 一行能放多少字；
+    纵向：行数少才有余量排多行（可用 665px：表头 76 + 每行 71）。
+    返回 (每行字数, 允许行数, 上限字数)。"""
+    cpl = max(7, int((avail_w / max(ncol, 1) - 44) / GEOM["font"]["table"]))
+    lines_ok = 3 if nrows <= 3 else (2 if nrows == 4 else 1)
+    return cpl, lines_ok, cpl * lines_ok
+
+
+def trim_text(t, limit):
+    """精简措辞（规范 §三 第 62 行：放不下先精简，禁止缩字号）。在标点处收口。"""
+    t = str(t).strip()
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    for sep in ("；", "。", "，", "、", "／", "/"):
+        i = cut.rfind(sep)
+        if i >= limit * 0.6:
+            return cut[:i] + "…"
+    return t[:max(limit - 1, 1)] + "…"          # 留一位给省略号，别超出上限
+
+
+def table_height(rows_items, ncol, avail_w=1728):
+    """表格自然高度（按**精简后**的文字 + 浏览器自适应列宽估算）。
+
+    实测模型：表头一行 76px、每行 71px，每多一行 +46.4px。
+    列宽不是等分的：浏览器按内容分配（长格给宽列），所以先用理想列宽判断要不要压缩，
+    只有压缩后仍放不下的格才换行——这解释了「6 行 4 列、每格 12 字」为何能一行放下。"""
     if not rows_items:
         return 0.0
+    cpl, lines_ok, lim = fit_limits(ncol, max(len(rows_items) - 1, 0), avail_w)
+    cells = [[trim_text(c, lim) for c in r] for r in rows_items]
     f = GEOM["font"]["table"]
-    colw = []
+    ideal = []
     for j in range(ncol):
-        ideal = max([text_width(r[j]) * f for r in rows_items if j < len(r)] + [0.0]) + 44
-        colw.append(max(ideal, 80.0))
-    total = sum(colw)
-    scale = min(1.0, avail_w / total) if total else 1.0
-    colw = [w * scale for w in colw]
+        w = max([text_width(r[j]) * f for r in cells if j < len(r)] + [0.0]) + 44
+        ideal.append(max(w, 80.0))
+    scale = min(1.0, avail_w / sum(ideal)) if sum(ideal) else 1.0
 
-    def lines_of(cells):
+    def lines_of(row):
         n = 1
-        for j, c in enumerate(cells):
-            room = max(colw[j] - 44, 20.0)
+        for j, c in enumerate(row):
+            room = max(ideal[j] * scale - 44, 24.0)
             w = text_width(c) * f
-            n = max(n, 1 if w <= room else int(-(-w // room)))
+            if w > room * 1.06:                 # 6% 容差：浏览器会挤压 padding，实测不换行
+                n = max(n, int(-(-w // room)))
         return n
 
-    head, *body = rows_items
-    nl = [lines_of(r) for r in body]
+    head, *body = cells
     h = GEOM["box"]["th"] + GEOM["line"]["th"] * (lines_of(head) - 1)
-    for n_ in nl:
-        h += GEOM["box"]["td"] + GEOM["line"]["table"] * (n_ - 1)
+    for r in body:
+        h += GEOM["box"]["td"] + GEOM["line"]["table"] * (lines_of(r) - 1)
     return h
 
 
@@ -2440,6 +2464,18 @@ def capacity_issues(page):
         n = len([x for x in info if re.search(r"\d", x)])
         if n > 4:
             out.append(("WARN", f"KPI 条 {n} 个 > 规范 3–4 个"))
+
+    # 像素级估算：按「精简后」的内容算这页占多高（不渲染）。
+    # 精度（2026-10-07 实测标定，30 页真实素材）：13 张表里 11 张误差 ≤3px，平均 20px、最大 ~120px，
+    # 所以余量阈值取 120px —— 宁可早提醒，也不要等渲染完才发现。
+    est = estimate_page(page)
+    if est["slack"] < 999:
+        if est["slack"] < 0:
+            out.append(("ERROR", f"预估内容高于画布：占用 {est['used']}/830px"
+                                 f"（超出 {-est['slack']}px）—— 按规范 §三 第 62 行精简/换版式/拆页"))
+        elif est["slack"] < 120:
+            out.append(("WARN", f"预估余量只有 {est['slack']}px（占用 {est['used']}/830px）"
+                                "—— 接近上限，建议精简一处"))
     return out
 
 

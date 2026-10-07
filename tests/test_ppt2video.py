@@ -443,3 +443,25 @@ def test_capacity_flags_header_row_mismatch():
     ok = {"n": 2, "title": "T", "layout": "表格(4 列，表头 + 1 行)（模板 table.html）",
           "info": ["表头：A · B · C · D", "甲 · 乙 · 丙", "续行内容"], "notes": ["x"], "sec": 30}
     assert not any("错位" in x[1] for x in m.capacity_issues(ok))
+
+
+# ── 像素级估算：按精简后内容算占高（实测标定：表 11/13 误差 ≤3px，平均 20px）──
+def test_estimate_page_fits_and_flags_tight_pages():
+    est = m.estimate_page(_page("表格(4 列，表头 + 4 行)（模板 table.html）",
+                                ["表头：A · B · C · D"] + ["甲 · 乙 · 丙 · 丁"] * 4))
+    assert est["slack"] > 0 and est["used"] > 0
+    # 余量不足 120px 要提醒；超出画布要报错
+    many = _page("表格(4 列，表头 + 8 行)（模板 table.html）",
+                 ["表头：A · B · C · D"] + ["甲 · 乙 · 丙 · 丁"] * 8)
+    lv = dict((x[1][:6], x[0]) for x in m.capacity_issues(many))
+    assert any("预估" in x[1] for x in m.capacity_issues(many))
+    # 满版页不参与（封面/章节页返回 999）
+    assert m.estimate_page(_page("封面：kicker（模板 cover.html）", ["kicker：x"]))["slack"] == 999
+
+
+def test_fit_limits_match_measured_capacity():
+    """每行容量必须与实测一致：4 列 → 12 字/行；3 行以内允许 3 行/格。"""
+    assert m.fit_limits(4, 6)[0] == 12
+    assert m.fit_limits(2, 4)[0] == 25
+    assert m.fit_limits(4, 3)[1] == 3 and m.fit_limits(4, 4)[1] == 2 and m.fit_limits(4, 6)[1] == 1
+    assert len(m.trim_text("一二三四五六七八九十", 5)) <= 5      # 省略号不超上限
