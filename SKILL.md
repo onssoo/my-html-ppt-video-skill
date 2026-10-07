@@ -26,7 +26,7 @@ description: Use when converting a document, article, or existing slide deck int
 |------|------|------|
 | **mlx-audio + Qwen3-TTS** | `~/.venv-mlx-audio`；模型 `Qwen3-TTS-12Hz-1.7B-Base-8bit`（克隆） | `ppt2video.py check` |
 | **ffmpeg** | ⚠️ **系统没有**；用 `imageio-ffmpeg` 自带的静态二进制 7.1，**自带 libass**（能烧字幕） | `resolve_ffmpeg()` 自动找 |
-| **浏览器** | ⚠️ **没有 Chrome**；用 **Microsoft Edge**（Chromium 内核，`--headless=new --screenshot` 参数通用） | `resolve_browser()` 自动找 4 个路径 |
+| **浏览器/截图** | 截图走 **Playwright Chromium**（`render()`；找不到才回退 msedge）；`check_deck.py` 用同一引擎，保证检查通过的画面 = 截图画面 | `pip install playwright && playwright install chromium` |
 | **中文字幕字体** | `mux()` 里写死 `FontName=Noto Sans SC`；本机若没这个字体会由 fontconfig 回退到系统中文字体（实测能正常显示，不变方块） | 改 `mux()` 里的 `force_style` |
 | **html-ppt skill** | Phase 1 做 PPT 用；本机 `~/html-ppt-skill`（`lewislulu/html-ppt-skill`） | — |
 | **cn2an** | 书面数字 → 口语读法（`40%`→"百分之四十"）；`~/.venv-mlx-audio` 已装 | `import cn2an` |
@@ -91,7 +91,9 @@ $PY ~/ppt2video.py build old/融资路演.pptx
 调用 **html-ppt skill** 制作。要点：
 
 1. **规划结构**：封面 → 路线图 → 内容页（每页一个核心观点）→ 要点回顾 → 结尾
-   - 目标 **10-16 页**（对应 3-5 分钟视频）
+   - 先按 **business-deck-spec.md §一** 定场景（受众/用途/时长/主线）→ 写 `大纲.md` → **Gate 1 审过才做 slides**
+   - 版式从 `html-ppt-skill/references/layouts.md` 的骨架里选（`ppt2video.py deck-skeleton 大纲.md` 可生成骨架）
+   - 做完跑 `check_deck.py`（规范 §七：逐页几何/字号/填充率检查，无 ERROR 才进 Gate 2）
 2. **选模板**：`~/html-ppt-skill/templates/full-decks/` 下有 15 套完整模板
    - 技术分享 → `tech-sharing`；商务汇报 → `corporate-clean`（主题）
    - 知识架构 → `knowledge-arch-blueprint`；课程 → `course-module`
@@ -179,7 +181,7 @@ $PY ~/ppt2video.py build deck/index.html
 
 | Gate | 什么时候 | 命令 | 产物 | owner 能改什么 |
 |---|---|---|---|---|
-| **1 大纲** | 读完源文档、**还没写 deck** 之前 | `outline outline.json` | `大纲-审定.md`：逐页标题/类型/要点/权重 + **时长与字数预算表** | `outline.json`：增删页、调顺序、改权重、改总时长、改受众与风格 |
+| **1 大纲** | 读完源文档、**还没写 deck** 之前 | `outline 大纲.md` | `大纲-审核报告.md`：总览 + 逐页问题 + **时长与字数预算表** | `outline.json`：增删页、调顺序、改权重、改总时长、改受众与风格 |
 | **2 画面 + 解说词** | deck 写完、解说词写完 | `deck-pdf <deck>` 和 `review-doc <deck> --version v` | `<deck>-预览.pdf`（像 PPT 一样翻）、`解说词审定稿-<版本>.md`（画面要点 / 讲述要点降序 / 解说词 / 字数 vs 目标 / lint） | deck 任意；解说词逐页文本 |
 | **3 成片** | `build` 出片之后 | `qc <deck> --version v` | `质检报告.md`：实测时长与偏差、**逐页目标 vs 实际**、偏短页、音量、字幕抽样、重录勾选表 | 勾 `重录` 列标记要重录的页；调 `speed`、换参考录音 |
 

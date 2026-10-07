@@ -149,3 +149,15 @@ def test_review_reset_preserves_hand_edited_cfg(tmp_path):
     assert m.parse_review(rv)[0]["ref_audio"] == "/tmp/voice.wav"
     m.cmd_review(str(deck), out, slides, reset=True, start=1)   # --reset
     assert "ref_audio: /tmp/voice.wav" in rv.read_text(encoding="utf-8")
+
+
+# ── data-sec 是绝对秒（规范 §六 第 84 行）：版本模式等比缩放，不是当权重 ──
+def test_page_seconds_scales_declared_seconds():
+    slides = [{"sec": 12, "fixed": "1"}, {"sec": 40, "fixed": None},
+              {"sec": 60, "fixed": None}, {"sec": 12, "fixed": "1"}]
+    s = m.page_seconds(slides, 120)                       # 目标 120 秒
+    assert abs(s[1] - 12) < 0.01 and abs(s[4] - 12) < 0.01        # fixed 页不缩放
+    assert abs(sum(s.values()) - 120) < 0.01                      # 总长精确命中
+    assert abs(s[2] / s[3] - 40 / 60) < 0.01                      # 非 fixed 页保持 40:60 比例
+    s2 = m.page_seconds(slides, 120, skip=(3,))
+    assert 3 not in s2 and abs(sum(s2.values()) - 120) < 0.01     # 跳页后仍命中总长

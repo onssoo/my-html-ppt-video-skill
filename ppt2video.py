@@ -43,10 +43,10 @@ LEAD, GAP, TAIL = 0.3, 0.25, 0.6  # 每页开头留白 / 句间停顿 / 每页�
 SUB_MAX = 24                      # 每行字幕最多字数
 PLACEHOLDER = "（在这里写解说词）"
 
-# 时长合理性区间（字/秒）：实测中文解说约 3.2 字/秒 → 0.31 s/字
-#   下界 0.20 → 最快 5 字/秒；上界 0.45 → 最慢 2.2 字/秒。超出即判定异常。
+# 每字耗时区间（秒/字）：判「这页讲太快/太慢」。
+#   0.16 s/字 ≈ 6.3 字/秒（快）；0.50 s/字 = 2 字/秒（慢）。超出即判异常。
 SEC_PER_CHAR_LO, SEC_PER_CHAR_HI = 0.16, 0.50
-CPS = 4.5   # 字/秒：每页目标字数 = data-sec × CPS，首次 build 后按实测校准
+CPS = 4.5   # 字/秒。目标字数 = 时长(秒) × CPS（business-deck-spec §八 第 104 行）；实测 4.4–5.2，首次 build 后校准
 MIN_SEC = 12        # 版本模式下每页最短时长；低于这个值一页讲不清楚，脚本会建议跳页
 OVER_TOL = 1.2      # 版本模式的上限容忍：超过目标上限 20% 才判"太长"（内容优先，不硬卡上限）
 DISCLAIMER = "以上财务数据为正向情景测算，不构成业绩或收益承诺，实际结果以正式披露为准。"
@@ -1013,6 +1013,29 @@ def allocate(slides, total, skip=()):
         print("  （有页面没设权重，按默认 45 平均分配；要差别对待就在 data-sec / slides.json 里设）")
     return secs
 
+def page_seconds(slides, total_sec, skip=()):
+    """版本模式下每页的目标秒数。
+
+    规范 §六 第 84 行：deck 的 `data-sec` 是**绝对秒**，不是权重。所以按声明秒数
+    **等比缩放**到目标总时长（封面/目录这类 fixed 页保持原值），不再把 data-sec 当权重
+    重新分配。没有声明秒数的页（旧 slides.json / json 大纲）才回退到按权重分配。
+    这样"同一份 deck 出 12/14 分钟两版"改的是**解说词详略**，不动页数。
+    """
+    keep = [s for i, s in enumerate(slides, 1) if i not in skip]
+    if keep and all(s.get("sec") for s in keep):
+        fixed = sum(float(s["sec"]) for s in keep if s.get("fixed"))
+        decl = sum(float(s["sec"]) for s in keep if not s.get("fixed"))
+        room = max(0.0, total_sec - fixed)
+        scale = room / decl if decl else 0.0
+        out = {}
+        for i, s in enumerate(slides, 1):
+            if i in skip:
+                continue
+            out[i] = float(s["sec"]) if s.get("fixed") else float(s["sec"]) * scale
+        return out
+    return allocate(slides, total_sec, skip)
+
+
 
 def tts_fingerprint(cfg):
     """语速与音色绑定：音色、后端、变速任一变化，cps 校准即作废。
@@ -1141,7 +1164,7 @@ def cmd_narrate(out, slides, v=None, source=None, pages=None, mode="auto", lo=10
     secs, cps, master = None, None, None
     if v:
         cps = load_cps(out, parse_review(rv)[0] if rv.exists() else None)
-        secs = allocate(slides, v["minutes"] * 60, v["skip"])
+        secs = page_seconds(slides, v["minutes"] * 60, v["skip"])
         if v.get("from"):
             mf = Path(out, "versions", v["from"], "narrations.json")
             if not mf.exists():
@@ -1318,7 +1341,7 @@ def cmd_build(out, slides, v=None):
     tts = QwenTTS(cfg) if cfg["backend"] == "qwen" else EdgeTTS(cfg)
     print(f"配音模式: {'克隆 ' + tts.ref_audio if getattr(tts, 'clone', False) else '预置音色 ' + cfg['speaker']}")
     cache = Path(out, "tts-cache"); cache.mkdir(exist_ok=True)   # 各版本共用：同句只合成一次
-    secs = allocate(slides, v["minutes"] * 60, v["skip"]) if v else None
+    secs = page_seconds(slides, v["minutes"] * 60, v["skip"]) if v else None
     if v:
         print(f"版本 {v['name']}：目标 {v['minutes']} 分钟 · {len(secs)} 页")
     silence = lambda s: np.zeros(int(round(s * SR)), dtype=np.int16)
@@ -1535,7 +1558,7 @@ def cmd_review_doc(deck, out, v=None, out_path=None):
     tdir = v["dir"] if v else Path(out)
     slides = load_slides(deck, out)
     cps = load_cps(out)
-    secs = allocate(slides, v["minutes"] * 60, v["skip"]) if v else None
+    secs = page_seconds(slides, v["minutes"] * 60, v["skip"]) if v else None
     nj = tdir / "narrations.json"
     if not nj.exists():
         sys.exit(f"还没有解说词：{nj}")
@@ -1598,7 +1621,7 @@ def cmd_qc(deck, out, v=None, out_path=None):
     if not ffc.exists() or not wav.exists():
         sys.exit(f"先出片（缺 {ffc.name} / {wav.name}）")
     slides = load_slides(deck, out)
-    secs = allocate(slides, v["minutes"] * 60, v["skip"]) if v else None
+    secs = page_seconds(slides, v["minutes"] * 60, v["skip"]) if v else None
     with wave.open(str(wav)) as w:
         total = w.getnframes() / w.getframerate()
         a = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768
@@ -2055,7 +2078,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             mins = (o or {}).get("minutes")
         if not budget and deck:
             sl = load_slides(deck, out)
-            secs = allocate(sl, v["minutes"] * 60, v["skip"]) if v else {}
+            secs = page_seconds(sl, v["minutes"] * 60, v["skip"]) if v else {}
             budget = [{"n": i + 1, "title": s["title"], "kind": "", "weight": s["sec"],
                        "fixed": s["fixed"], "disc": s["disc"], "sec": round(secs.get(i + 1, 0), 1),
                        "lo": int(chars_for(secs.get(i + 1, 0), cps) * 0.9),
