@@ -2349,6 +2349,24 @@ def estimate_page(page):
 
 
 
+
+def split_cells(line):
+    """按「 · 」切表格列，**忽略括号内的分隔符**。
+    实测踩坑：`发光层整体方案（RD／GD／BD · RH／GH／BH · R'G'B'）` 曾被切坏成 3 列。"""
+    parts, depth, cur, i = [], 0, "", 0
+    while i < len(line):
+        ch = line[i]
+        if ch in "（(":
+            depth += 1
+        elif ch in "）)":
+            depth = max(0, depth - 1)
+        if depth == 0 and line[i:i + 3] == " · ":
+            parts.append(cur.strip()); cur = ""; i += 3; continue
+        cur += ch; i += 1
+    parts.append(cur.strip())
+    return [x for x in parts if x != ""]
+
+
 def capacity_issues(page):
     """按规范 §三 第 61 行的容量表，在设计阶段就判定「这一页装不下」。
 
@@ -2367,13 +2385,23 @@ def capacity_issues(page):
         for it in info:
             m = re.match(r"^表头[：:]\s*(.+)$", it)
             if m:
-                head = [x.strip() for x in m.group(1).split("·")]
+                head = split_cells(m.group(1))
                 continue
             if re.match(r"^(图注|说明|结论框|结论)[：:]", it):
                 if re.match(r"^(图注|说明)[：:]", it):
                     caps.append(re.sub(r"^(图注|说明)[：:]\s*", "", it))
                 continue
-            rows.append([x.strip() for x in it.split("·")])
+            cells = split_cells(it)
+            if len(cells) == 1 and rows and len(rows[-1]) < len(head or rows[-1]) + 1:
+                rows[-1].append(cells[0])          # 续行：并进上一行（P18 的写法）
+            else:
+                rows.append(cells)
+        if head and rows:
+            bad = [(k + 1, len(r)) for k, r in enumerate(rows) if len(r) != len(head)]
+            if bad:
+                out.append(("ERROR", f"表头 {len(head)} 列，但第 {[b[0] for b in bad]} 行是 "
+                                     f"{[b[1] for b in bad]} 列 —— 画面会错位；"
+                                     "一行的各列用「 · 」分隔，格内列举用「／」或「、」"))
         ncol = max(len(head), max((len(r) for r in rows), default=1))
         if ncol > 4:
             out.append(("ERROR", f"表格 {ncol} 列 > 规范上限 4 列"))

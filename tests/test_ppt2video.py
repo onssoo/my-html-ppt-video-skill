@@ -421,3 +421,22 @@ def test_capacity_geometry_matches_measured_constants():
     assert m.GEOM["title"] == 141 and m.GEOM["pad_top"] + m.GEOM["pad_bottom"] == 92
     # 表格高度模型：4 行 1 行文字 = 76 + 4×71（实测 362）
     assert m.table_height([["A"] * 4] + [["甲"] * 4] * 4, 4) == 76 + 4 * 71
+
+
+# ── 表格切列与行列一致性（实测踩坑：括号内的「 · 」、以及一行被写成两条信息点）──
+def test_split_cells_ignores_parentheses():
+    assert m.split_cells("甲 · 乙 · 丙") == ["甲", "乙", "丙"]
+    # 括号内的「 · 」不是列分隔（P14 曾被切坏成 6 列）
+    s = "发光层整体方案（RD／GD／BD · RH／GH／BH · R'G'B'） · 各项 10–15% · 各项 40%"
+    assert len(m.split_cells(s)) == 3
+
+
+def test_capacity_flags_header_row_mismatch():
+    p = {"n": 1, "title": "T", "layout": "表格(4 列，表头 + 2 行)（模板 table.html）",
+         "info": ["表头：A · B · C · D", "甲 · 乙", "丙 · 丁 · 戊 · 己"], "notes": ["x"], "sec": 30}
+    iss = m.capacity_issues(p)
+    assert any(x[0] == "ERROR" and "列" in x[1] and "错位" in x[1] for x in iss)
+    # 续行（只有 1 格）会被并进上一行，不算错位
+    ok = {"n": 2, "title": "T", "layout": "表格(4 列，表头 + 1 行)（模板 table.html）",
+          "info": ["表头：A · B · C · D", "甲 · 乙 · 丙", "续行内容"], "notes": ["x"], "sec": 30}
+    assert not any("错位" in x[1] for x in m.capacity_issues(ok))
