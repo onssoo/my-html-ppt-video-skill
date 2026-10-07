@@ -74,7 +74,7 @@ LLM 端点、文档解析服务、TTS 模型路径、参考录音都从**本地�
 ## 规范血缘
 
 - **流程与密度规则**从属于《商务演示文稿制作规范》（`business-deck-spec.md`）：大纲格式、信息点 6–10、字号、逐字稿生成原则。
-- **版式骨架**来自 `html-ppt-skill`（`references/layouts.md` 的骨架清单）。
+- **版式骨架**来自配套的 `html-ppt-skill` 仓库（它自己的 `references/layouts.md` 列出全部骨架）。
 - 与上游原版的差异见 `UPSTREAM.md`。
 
 ## 仓库结构
