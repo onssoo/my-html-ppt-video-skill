@@ -8,13 +8,24 @@
   · HF 直连被墙 → 模型必须用**本地绝对路径**，不能用 HF 仓库 ID
   · 不设 repetition_penalty 会翻车（实测 44 字念出 32 秒）
 
-用法：
+用法（HTML 输入）：
   python ppt2video.py check
   python ppt2video.py narrate deck/index.html     # 调 DGX infersight 写解说词
   python ppt2video.py review  deck/index.html     # 截图 + 生成 review.md
   python ppt2video.py build   deck/index.html     # 配音 + 字幕 + 合成视频
+
+用法（PPTX / PDF 输入 —— 画面已定稿，跳过 HTML PPT 那一段）：
+  python ppt2video.py import  old/路演.pptx  [--]  # 渲染截图 + 生成 slides.json
+  python ppt2video.py narrate old/路演.pptx --source 原文.docx --brief brief.md
+  python ppt2video.py review  old/路演.pptx --reset
+  python ppt2video.py build   old/路演.pptx
+
+输入格式：
+  · HTML：<section class="slide" data-title="…">，用 #/N 深链逐页截图
+  · PPTX / PDF：import 一次性渲染成 slides/ 下的 PNG，其余命令只读 slides.json，
+    不再关心原始格式（narrate / review / build 三条路径与 HTML 完全相同）
 """
-import argparse, asyncio, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, wave
+import argparse, asyncio, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, time, wave
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
@@ -30,6 +41,8 @@ PLACEHOLDER = "（在这里写解说词）"
 #   下界 0.20 → 最快 5 字/秒；上界 0.45 → 最慢 2.2 字/秒。超出即判定异常。
 SEC_PER_CHAR_LO, SEC_PER_CHAR_HI = 0.16, 0.50
 CPS = 4.5   # 字/秒：每页目标字数 = data-sec × CPS，首次 build 后按实测校准
+MIN_SEC = 12        # 版本模式下每页最短时长；低于这个值一页讲不清楚，脚本会建议跳页
+OVER_TOL = 1.2      # 版本模式的上限容忍：超过目标上限 20% 才判"太长"（内容优先，不硬卡上限）
 DISCLAIMER = "以上财务数据为正向情景测算，不构成业绩或收益承诺，实际结果以正式披露为准。"
 DISC_WORDS = r"不构成.{0,6}承诺|情景测算|以正式披露为准"
 OPENERS = ["首先", "其次", "最后", "那么"]   # 只查句首（避免误伤"最后一公里""最后阶段"）
@@ -81,6 +94,9 @@ def resolve_ffmpeg():
 CHROME = resolve_browser()
 FFMPEG = resolve_ffmpeg()
 
+# PPTX 没有同名 PDF 时的兜底转换器。字体/特效可能与原稿有差异，见 SKILL.md「还原度」。
+SOFFICE = os.environ.get("SOFFICE", "/Applications/LibreOffice.app/Contents/MacOS/soffice")
+
 # ─── 默认配置 ────────────────────────────────────────────
 # 注意：qwen_model 必须是**本地绝对路径**——用 HF 仓库 ID 会触发联网下载，而 HF 被墙。
 DEFAULTS = {
@@ -97,6 +113,9 @@ DEFAULTS = {
     "edge_rate": "+5%",
     "subtitles": "burn",          # burn（烧录）/ soft（软字幕）/ off
     "speed": 1.15,                # 变速（ffmpeg atempo，不变调）。模型自带的 speed 参数在克隆模式下无效，只能后处理
+    # —— 画面构图（导入的旧 PPTX/PDF 没有预留字幕区时用 letterbox）——
+    "frame": "fit",               # fit：铺满画面，居中留边；letterbox：画面上移，底部留 120px 给字幕
+    "pad_color": "black",         # 留边颜色，可写成与幻灯片底色一致，如 0x0B1F3A
 }
 
 # narrate 默认走 DGX 上的 infersight 网关
@@ -161,6 +180,7 @@ class SlideParser(HTMLParser):
                 self.depth = 1
                 self.slides.append({"title": (a.get("data-title") or "").strip(),
                                     "sec": int(a["data-sec"]) if (a.get("data-sec") or "").isdigit() else None,
+                                    "fixed": a.get("data-fixed"),
                                     "disc": "data-disclaimer" in a,
                                     "text": [], "notes": []})
             elif self.depth:
@@ -234,16 +254,176 @@ def render(deck, out, n, start):
         b.close()
 
 
+# ─── PPTX / PDF 导入（跳过 HTML PPT 那一段：画面已定稿）─────
+# 依赖：pip install pymupdf python-pptx
+#   · PDF  ：PyMuPDF 逐页渲染成 PNG + 提取文字（PDF 里没有演讲者备注）
+#   · PPTX ：python-pptx 提取标题/文字/表格/图表数据/演讲者备注；截图走同名 PDF，
+#            没有同名 PDF 时才用 LibreOffice 转（字体与特效可能有差异）
+# 中间文件 slides.json 可以手工编辑 sec（目标秒数）/ disc（是否要免责语）/ notes（讲述要点），
+# 重新导入时会保留这三次改动。
+
+def pdf_pages(pdf, out):
+    """PDF 逐页渲染成 PNG（按原比例放进 1920×1080，不裁剪），并提取标题和文字。"""
+    try:
+        import fitz
+    except ImportError:
+        sys.exit("需要 PyMuPDF：pip install pymupdf")
+    fitz.TOOLS.mupdf_display_errors(False)             # LibreOffice 导出的 PDF 会刷 structure tree 噪音
+    d = Path(out, "slides")
+    d.mkdir(parents=True, exist_ok=True)
+    for f in d.glob("*.png"):
+        f.unlink()                                     # 重新导入时清掉上一版截图
+    pages = []
+    with fitz.open(pdf) as doc:
+        for i, pg in enumerate(doc, 1):
+            z = min(1920 / pg.rect.width, 1080 / pg.rect.height)
+            pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False).save(str(d / f"{i:03d}.png"))
+            top = [s for b in pg.get_text("dict")["blocks"] for l in b.get("lines", [])
+                   for s in l["spans"] if s["text"].strip() and s["bbox"][1] < pg.rect.height * 0.3]
+            title = max(top, key=lambda s: s["size"])["text"].strip() if top else ""
+            text = [x.strip() for x in pg.get_text().splitlines() if x.strip()]
+            pages.append({"title": title, "text": text})
+    print(f"  ✔ 渲染 {len(pages)} 页 → {d}")
+    return pages
+
+
+def pptx_to_pdf(pptx, out):
+    """优先用同名 PDF（放在 PPTX 旁边、且比它新）；其次复用上次转换出来的 PDF；都没有才调 LibreOffice。"""
+    same = Path(pptx).with_suffix(".pdf")
+    cands = [same, Path(out, Path(pptx).stem + ".pdf")]
+    fresh = [c for c in cands if c.exists() and c.stat().st_mtime >= Path(pptx).stat().st_mtime]
+    if fresh:
+        pick = max(fresh, key=lambda c: c.stat().st_mtime)
+        print(f"  使用已有 PDF：{pick.name}")
+        return pick
+    exe = SOFFICE if os.path.exists(SOFFICE) else shutil.which("soffice")
+    if not exe:
+        sys.exit("没有同名 PDF，也找不到 LibreOffice。建议用 PowerPoint/Keynote 导出同名 PDF 放在旁边")
+    print("  用 LibreOffice 转换 PDF（字体和特效可能与原稿有差异）…")
+    r = subprocess.run([exe, "-env:UserInstallation=file:///tmp/lo_ppt2video", "--headless",
+                        "--convert-to", "pdf", "--outdir", str(out), str(pptx)],
+                       capture_output=True, text=True)
+    pdf = Path(out, Path(pptx).stem + ".pdf")
+    if not pdf.exists():          # LibreOffice 常把告警写到 stderr；判据是产物存在，不是返回码
+        sys.exit(f"LibreOffice 转换失败：{r.stdout[-300:]}{r.stderr[-300:]}")
+    return pdf
+
+
+def pptx_slides(path):
+    """提取每页标题、文字、表格、图表数据和演讲者备注（跳过隐藏页）。"""
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    except ImportError:
+        sys.exit("需要 python-pptx：pip install python-pptx")
+
+    def texts(shapes):
+        for sh in shapes:
+            if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                yield from texts(sh.shapes)
+            elif sh.has_text_frame and sh.text_frame.text.strip():
+                yield sh.text_frame.text.strip()
+            elif getattr(sh, "has_table", False) and sh.has_table:
+                for row in sh.table.rows:
+                    yield " | ".join(c.text.strip() for c in row.cells)
+            elif getattr(sh, "has_chart", False) and sh.has_chart:
+                try:                                   # 图表里的数字也提取出来，供数字溯源使用
+                    for plot in sh.chart.plots:
+                        cats = list(plot.categories)
+                        for ser in plot.series:
+                            # 整数不要写成 7300.0：否则解说词写"7300"会被数字溯源误判为无出处
+                            vals = [int(v) if isinstance(v, float) and v.is_integer() else v
+                                    for v in ser.values]
+                            yield f"{ser.name}：" + "，".join(f"{c} {v}" for c, v in zip(cats, vals))
+                except Exception as e:
+                    print(f"    ⚠ 有一张图表没提取到数据（{type(e).__name__}），请人工核对")
+
+    slides = []
+    for sl in Presentation(path).slides:
+        if sl._element.get("show") == "0":             # 隐藏页
+            continue
+        t = sl.shapes.title
+        title = t.text_frame.text.strip() if t is not None and t.has_text_frame else ""
+        nf = sl.notes_slide.notes_text_frame if sl.has_notes_slide else None
+        notes = nf.text.strip() if nf is not None else ""
+        slides.append({"title": title, "sec": None, "fixed": None, "disc": False,
+                       "text": [x for x in texts(sl.shapes) if x != title],
+                       "notes": [notes] if notes else []})
+    return slides
+
+
+def cmd_import(deck, out):
+    p, sj = Path(deck), Path(out, "slides.json")
+    suf = p.suffix.lower()
+    if suf == ".pptx":
+        slides = pptx_slides(p)
+        pages = pdf_pages(pptx_to_pdf(p, out), out)
+        if len(slides) != len(pages):
+            sys.exit(f"PPTX 有 {len(slides)} 页可见幻灯片，PDF 有 {len(pages)} 页，无法一一对应。\n"
+                     f"  常见原因：① LibreOffice 把隐藏页也导出了（请用 PowerPoint 自己导出 PDF）\n"
+                     f"  ② 同名 PDF 是旧版本 ③ 幻灯片版式异常。请处理后重试")
+        for s, pg in zip(slides, pages):
+            s["title"] = s["title"] or pg["title"]
+    elif suf == ".pdf":
+        slides = [{"title": pg["title"], "sec": None, "fixed": None, "disc": False,
+                   "text": pg["text"], "notes": []}
+                  for pg in pdf_pages(p, out)]
+    elif suf == ".ppt":
+        sys.exit("不支持旧版 .ppt，请先另存为 .pptx 或导出 PDF")
+    else:
+        sys.exit(f"不支持导入 {suf or '（无扩展名）'}，只支持 .pptx / .pdf")
+
+    if sj.exists():                                    # 保留上次手工改过的内容
+        try:
+            old = json.loads(sj.read_text(encoding="utf-8"))
+        except Exception:
+            old = []
+        if len(old) != len(slides):
+            print(f"⚠ 页数有变化（{len(old)} → {len(slides)}），已按页码保留旧的 sec / disc / notes，请核对")
+        for s, o in zip(slides, old):
+            s["sec"], s["disc"] = o.get("sec"), o.get("disc", False)
+            s["fixed"] = o.get("fixed")
+            if not s["notes"] and o.get("notes"):
+                s["notes"] = o["notes"]
+    sj.write_text(json.dumps(slides, ensure_ascii=False, indent=2), encoding="utf-8")
+    empty = [i for i, s in enumerate(slides, 1) if not s["text"]]
+    noted = sum(bool(s["notes"]) for s in slides)
+    print(f"已写入 {sj}：{len(slides)} 页，{noted} 页有备注"
+          + (f"；第 {empty} 页没有提取到文字（可能是纯图片），建议补 notes 或加 --vision" if empty else ""))
+    print("下一步：检查 slides/ 下的截图；在 slides.json 里设置 sec / disc / notes，然后跑 narrate")
+
+
+def load_slides(deck, out):
+    """HTML 走 DOM 解析；PPTX/PDF 走 slides.json（不存在或比源文件旧时自动 import）。"""
+    if Path(deck).suffix.lower() in (".html", ".htm"):
+        return extract(deck)
+    sj = Path(out, "slides.json")
+    if not sj.exists() or sj.stat().st_mtime < Path(deck).stat().st_mtime:
+        cmd_import(deck, out)
+    slides = json.loads(sj.read_text(encoding="utf-8"))
+    for s in slides:                                   # 允许在 JSON 里把 notes 写成字符串
+        if isinstance(s.get("notes"), str):
+            s["notes"] = [s["notes"]] if s["notes"].strip() else []
+        s.setdefault("title", ""); s.setdefault("sec", None); s.setdefault("fixed", None)
+        s.setdefault("disc", False); s.setdefault("text", []); s.setdefault("notes", [])
+    return slides
+
+
 # ─── review.md ───────────────────────────────────────────
 
-def write_review(path, slides, narr, cfg):
+def write_review(path, slides, narr, cfg, skip=(), slides_dir=None):
+    d = Path(path).parent
+    sdir = Path(slides_dir) if slides_dir else d / "slides"
     lines = ["---", *[f"{k}: {v}" for k, v in cfg.items()], "---", "",
              "<!-- 改代码块里的解说词；[ ] 改成 [x] 跳过该页；",
              "     backend: qwen / edge ；subtitles: burn / soft / off",
+             "     frame: fit / letterbox ；pad_color: black 或 0x0B1F3A",
              "     ref_audio 填本地录音路径 = 克隆你的声音；清空则用 speaker 预置音色 -->", ""]
     for i, s in enumerate(slides, 1):
         title = s["title"] or (s["text"][0][:20] if s["text"] else f"Slide {i}")
-        lines += [f"# {i} · {title}", "", "- [ ] 跳过此页", "", f"![](slides/{i:03d}.png)", "",
+        mark = "x" if i in skip else " "                 # 版本里 skip 掉的页默认勾上
+        rel = os.path.relpath(sdir / f"{i:03d}.png", d)  # 版本目录下要回退两级，必须算相对路径
+        lines += [f"# {i} · {title}", "", f"- [{mark}] 跳过此页", "", f"![]({rel})", "",
                   "```", narr.get(str(i), PLACEHOLDER), "```", ""]
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
@@ -408,6 +588,23 @@ class EdgeTTS:
         os.remove(tmp)
 
 
+def synth_retry(tts, text, path, tries=3):
+    """TTS 是网络/推理调用：实测被瞬时抖动打断过（edge 的 NoAudioReceived、网关 reset）。
+    有限次退避重试；仍失败就抛出——不吞错，也不把失败的产物留在缓存里。"""
+    for k in range(1, tries + 1):
+        try:
+            tts.synth(text, path)
+            if path.exists() and path.stat().st_size > 0:
+                return
+            raise RuntimeError("产出是空文件")
+        except Exception as e:
+            if k == tries:
+                raise
+            wait = 2 ** k
+            print(f"    ↻ 合成失败（{type(e).__name__}: {str(e)[:60]}），{wait}s 后重试 {k}/{tries - 1}")
+            time.sleep(wait)
+
+
 def cached_many(tts, texts, cache):
     """返回 texts 对应的 wav 路径列表；未命中的句子**一次 batch** 合成。"""
     paths, miss = [], []
@@ -424,7 +621,7 @@ def cached_many(tts, texts, cache):
         except Exception as e:
             print(f"    ⚠ batch 失败（{type(e).__name__}: {str(e)[:80]}），退回逐句")
             for t, p in miss:
-                tts.synth(t, p)
+                synth_retry(tts, t, p)
         else:
             for (t, p), a in zip(miss, audios):
                 write_wav(p, (np.clip(a, -1, 1) * 32767).astype(np.int16), tts.sr)
@@ -435,7 +632,7 @@ def cached(tts, text, cache):
     h = hashlib.sha1(json.dumps(tts.key + [text], ensure_ascii=False).encode()).hexdigest()[:16]
     p = cache / f"{h}.wav"
     if not p.exists():
-        tts.synth(text, p)
+        synth_retry(tts, text, p)
     return p
 
 
@@ -506,7 +703,43 @@ PRON_FILE = Path(os.environ.get("PRONOUNCE", "pronounce.json"))
 PRON = json.loads(PRON_FILE.read_text(encoding="utf-8")) if PRON_FILE.exists() else {}
 # 单位/范围 → 读法（先于 cn2an，避免 cn2an 把 "ms" 当字母读）。
 # 用 (?![A-Za-z]) 而非 \b：数字后面常跟中文（"120ms降"），\b 在 CJK 前不成立。
+# 金额单位：万元到了"亿"的量级就折算成亿元（100000 万元 → 10亿元 → 十亿元）。
+# 千万级及以下保持"万元"，由 cn2an 读成"七千三百万元"——那本来就是中文的自然说法。
+_WAN = r"(\d[\d,]*(?:\.\d+)?)"
+_WAN_RANGE = re.compile(_WAN + r"\s*[–\-~～至]\s*" + _WAN + r"\s*万元")
+_WAN_ONE = re.compile(_WAN + r"\s*万元")
+
+
+def _yi_label(raw):
+    """万元数值 → 亿元写法；不到 1 亿返回 None（表示保持原样）。"""
+    try:
+        v = float(raw.replace(",", ""))
+    except ValueError:
+        return None
+    if v < 10000:
+        return None
+    return f"{v / 10000:.4f}".rstrip("0").rstrip(".") + "亿元"
+
+
+def _wan_range_sub(m):
+    a, b = _yi_label(m.group(1)), _yi_label(m.group(2))
+    if not a and not b:
+        return m.group(0)
+    return f"{a or m.group(1).replace(',', '') + '万元'}到{b or m.group(2).replace(',', '') + '万元'}"
+
+
+# 年份必须**逐位**读："2026 年" → "二零二六年"。不处理的话 cn2an 会当数量念成"二千零二十六年"。
+# 只认 19xx/20xx/21xx，避免把 "1200 年历史" 这类数量误读成"一二零零年"。
+# 这两条必须排在区间规则之前，否则 "2026–2030 年" 会先被拆成 "2026到2030 年"。
+_D = "零一二三四五六七八九"
+_digits = lambda s: "".join(_D[int(c)] for c in s)
+_YEAR_ONE = re.compile(r"((?:19|20|21)\d{2})\s*年")
+_YEAR_RANGE = re.compile(r"((?:19|20|21)\d{2})\s*[–\-~～至]\s*((?:19|20|21)\d{2})\s*年")
 _SPEAK_RULES = [
+    (_WAN_RANGE, _wan_range_sub),                       # 金额规则要在通用区间规则之前
+    (_WAN_ONE, lambda m: _yi_label(m.group(1)) or m.group(0)),
+    (_YEAR_RANGE, lambda m: f"{_digits(m.group(1))}年到{_digits(m.group(2))}年"),
+    (_YEAR_ONE, lambda m: f"{_digits(m.group(1))}年"),
     (re.compile(r"(\d)\s*[–\-~～]\s*(\d)"), r"\1到\2"),
     (re.compile(r"(\d)\s*ms(?![A-Za-z])"), r"\1毫秒"),
     (re.compile(r"(\d)\s*[xX×](?![A-Za-z])"), r"\1倍"),
@@ -557,6 +790,16 @@ def cmd_check():
     row(importlib.util.find_spec("mlx_audio") is not None, "mlx-audio", "pip install mlx-audio", False)
     row(importlib.util.find_spec("edge_tts") is not None, "edge-tts", "pip install edge-tts", False)
     row(importlib.util.find_spec("numpy") is not None, "numpy", "pip install numpy")
+    # ★ 导入 PPTX/PDF 才需要（HTML 流程不依赖）
+    row(importlib.util.find_spec("fitz") is not None, "pymupdf（PPTX/PDF 导入）",
+        "pip install pymupdf", required=False)
+    row(importlib.util.find_spec("pptx") is not None, "python-pptx（PPTX 导入）",
+        "pip install python-pptx", required=False)
+    so = SOFFICE if os.path.exists(SOFFICE) else shutil.which("soffice")
+    row(so is not None, "LibreOffice（PPTX→PDF 兜底）",
+        "只影响 PPTX；旁边放一份同名 PDF 就不需要", required=False)
+    if so:
+        print(f"      {so}")
     # ★ 新增：本地模型存在性（HF ID 会触发下载 → 被墙，这是最容易踩的坑）
     for tag, p in (("克隆模型", DEFAULTS["qwen_model"]), ("参考音频", DEFAULTS["ref_audio"])):
         exists = os.path.exists(p)
@@ -628,12 +871,18 @@ def relevant(chunks, query, k=4, budget=6000):
     return "\n\n---\n\n".join(chunks[i] for i in sorted(picked))   # 保持原文顺序
 
 
-def llm(system, user):
+def llm(system, user, image=None):
     base = (os.environ.get("LLM_BASE_URL") or DEFAULT_LLM_BASE).rstrip("/")
     model = os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
+    content = user
+    if image:
+        import base64
+        b64 = base64.b64encode(Path(image).read_bytes()).decode()
+        content = [{"type": "text", "text": user},
+                   {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]
     body = {"model": model, "temperature": 0.5,
             "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}]}
+                         {"role": "user", "content": content}]}
     req = urllib.request.Request(
         f"{base}/chat/completions", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json",
@@ -661,10 +910,106 @@ def parse_pages(s, n):
 
 
 def page_floor(sec, lo):
-    """有 data-sec 时按 时长×CPS×0.8 推字数下限，否则用全局 lo。只设下限不设上限。"""
+    """【单版本模式】有 data-sec 时按 时长×CPS×0.8 推字数下限，否则用全局 lo。只设下限不设上限。
+    版本模式（--version）不用这个，走 chars_for/allocate。"""
     if sec:
         return max(lo, int(sec * CPS * 0.8))
     return lo
+
+
+# ─── 多版本（versions.json）：同一份幻灯片按不同时长出多版 ───
+# 时长不直接交给模型（模型对"分钟"没有概念），一律换算成每页字数目标。
+
+def chars_for(sec, cps):
+    """每页秒数 → 字数。扣掉页首页尾留白，并把句间停顿算进去（约每 25 字一句）。
+    与 cmd_build 的时长构成一致：LEAD + TAIL + Σ句子 + 句数×GAP。"""
+    speech = max(sec - LEAD - TAIL, 3)
+    return int(speech * cps / (1 + GAP * cps / 25))
+
+
+def allocate(slides, total, skip=()):
+    """把总时长按权重分到每页。fixed 页取固定值不参与缩放；权重用 sec，缺省 45。"""
+    idx = [i for i in range(len(slides)) if i + 1 not in skip]
+    fixed, w = {}, {}
+    for i in idx:
+        f = slides[i].get("fixed")
+        try:
+            f = float(f) if f not in (None, "") else None
+        except (TypeError, ValueError):
+            print(f"⚠ 第 {i+1} 页的 fixed 不是数字（{slides[i].get('fixed')!r}），按不固定处理")
+            f = None
+        if f:
+            fixed[i] = f
+        else:
+            w[i] = float(slides[i].get("sec") or 45)
+    free = max(total - sum(fixed.values()), 0.0)
+    wsum = sum(w.values()) or 1.0
+    secs = {i + 1: (fixed[i] if i in fixed else free * w[i] / wsum) for i in idx}
+    short = sorted(p for p, s in secs.items() if s < MIN_SEC)
+    if short:
+        print(f"⚠ 第 {short} 页只分到不足 {MIN_SEC} 秒，建议在 versions.json 里 skip 部分页面")
+    secs = {p: max(MIN_SEC, s) for p, s in secs.items()}
+    got = sum(secs.values())        # 钳制后总长会超标 → 必须报出来，不能静默
+    if got > total + 0.5:
+        print(f"⚠ 因每页下限 {MIN_SEC} 秒，实际总长 {got / 60:.1f} 分钟 > 目标 {total / 60:.1f} 分钟")
+    if not all(slides[i].get("sec") or slides[i].get("fixed") for i in idx):
+        print("  （有页面没设权重，按默认 45 平均分配；要差别对待就在 data-sec / slides.json 里设）")
+    return secs
+
+
+def tts_fingerprint(cfg):
+    """语速与音色绑定：音色、后端、变速任一变化，cps 校准即作废。
+    读法规则也算在内——实测修了年份读法后同一句话的音频变短，cps 从 4.43 跳到 5.16，
+    旧的校准值若被沿用，之后所有版本的时长都会偏短。"""
+    if cfg.get("backend") == "qwen":
+        voice = cfg.get("ref_audio") or f"speaker:{cfg.get('speaker')}"
+    else:
+        voice = f"edge:{cfg.get('edge_voice')}:{cfg.get('edge_rate')}"
+    return {"backend": cfg.get("backend"), "voice": voice,
+            "speed": float(cfg.get("speed") or 1.0),
+            "speak": hashlib.sha1("".join(p.pattern for p, _ in _SPEAK_RULES).encode()).hexdigest()[:8]}
+
+
+def load_cps(out, cfg=None):
+    """读实测语速。给了 cfg 就校验指纹，不匹配视为无效（只改音色/语速不重校准 → 全长跑偏）。"""
+    f = Path(out, "cps.json")
+    default = float(os.environ.get("CPS", "4.5"))
+    if not f.exists():
+        return default
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    if cfg is not None and d.get("fingerprint") and d["fingerprint"] != tts_fingerprint(cfg):
+        print("⚠ cps.json 的音色/后端/语速与当前配置不一致，已作废，按默认估算；建议重做一次母版校准")
+        return default
+    return float(d.get("cps") or default)
+
+
+def load_version(deck, out, name):
+    """读 versions.json 里的一条版本配置。--version 不传时返回 None（走老的单版本流程）。"""
+    vf = Path(deck).parent / "versions.json"
+    if not vf.exists():
+        sys.exit(f"指定了 --version {name}，但 {vf} 不存在")
+    try:
+        all_v = json.loads(vf.read_text(encoding="utf-8"))
+    except Exception as e:
+        sys.exit(f"versions.json 解析失败：{e}")
+    v = all_v.get(name)
+    if v is None:
+        sys.exit(f"versions.json 里没有版本 {name!r}；现有：{', '.join(all_v) or '（空）'}")
+    v = dict(v); v["name"] = name
+    v["dir"] = Path(out, "versions", name); v["dir"].mkdir(parents=True, exist_ok=True)
+    v["skip"] = set(v.get("skip", []))
+    v["brief_text"] = ""
+    if v.get("brief"):
+        bf = Path(deck).parent / v["brief"]
+        if not bf.exists():
+            sys.exit(f"版本 {name} 的 brief 文件不存在：{bf}")
+        v["brief_text"] = bf.read_text(encoding="utf-8").strip()
+    if not v.get("minutes"):
+        sys.exit(f"版本 {name} 必须写 minutes")
+    return v
 
 
 def ungrounded_numbers(text, grounded):
@@ -708,33 +1053,61 @@ def lint(text, lo, grounded=None, disc=False):
     return issues
 
 
-def cmd_narrate(out, slides, source=None, pages=None, mode="auto", lo=100, hi=180, brief=None):
+def cmd_narrate(out, slides, v=None, source=None, pages=None, mode="auto", lo=100, hi=180,
+                brief=None, vision=False):
     """逐页生成解说词。每页独立调用 LLM（system 带本页免责口径），不再整篇一次生成——
-    整篇模式会让模型套用"承接→结论→引出"的固定结构，写出电报体碎句。"""
-    n, outline = len(slides), write_outline(out, slides)
-    nj, rv = Path(out, "narrations.json"), Path(out, "review.md")
+    整篇模式会让模型套用"承接→结论→引出"的固定结构，写出电报体碎句。
+
+    v 不为 None 时走版本模式：总时长按权重分到每页，再换算成每页字数目标；
+    v["from"] 有值时从母版的解说词**压缩**，而不是重新创作。"""
+    tdir = v["dir"] if v else Path(out)
+    n = len(slides)
+    write_outline(tdir, slides)
+    nj, rv = tdir / "narrations.json", tdir / "review.md"
     narr = json.loads(nj.read_text(encoding="utf-8")) if nj.exists() else {}
     src = load_source(source) if source else ""
     if src:
-        Path(out, "source.md").write_text(src, encoding="utf-8")   # 方便检查 docx 转换效果
-    brief = (Path(brief).read_text(encoding="utf-8").strip() if brief else "")
+        Path(out, "source.md").write_text(src, encoding="utf-8")   # 源文档各版本共用
+    # brief 优先级：命令行 --brief > versions.json 里的 brief
+    brief = (Path(brief).read_text(encoding="utf-8").strip() if brief
+             else (v["brief_text"] if v else ""))
     if brief:
-        Path(out, "brief.md").write_text(brief, encoding="utf-8")
+        (tdir / "brief.md").write_text(brief, encoding="utf-8")
     save = lambda: nj.write_text(json.dumps(dict(sorted(narr.items(), key=lambda kv: int(kv[0]))),
                                             ensure_ascii=False, indent=2), encoding="utf-8")
     chunks = chunk_source(src) if src else []
     title = lambda t: t["title"] or (t["text"][0][:20] if t["text"] else "")
-    targets = pages or range(1, n + 1)
+
+    secs, cps, master = None, None, None
+    if v:
+        cps = load_cps(out, parse_review(rv)[0] if rv.exists() else None)
+        secs = allocate(slides, v["minutes"] * 60, v["skip"])
+        if v.get("from"):
+            mf = Path(out, "versions", v["from"], "narrations.json")
+            if not mf.exists():
+                sys.exit(f"先生成母版 {v['from']}（{mf} 不存在）")
+            master = json.loads(mf.read_text(encoding="utf-8"))
+            if nj.exists() and mf.stat().st_mtime > nj.stat().st_mtime:
+                print(f"⚠ 母版 {v['from']} 比本版解说词新，本版可能已过期，建议重跑本版")
+        print(f"版本 {v['name']}：目标 {v['minutes']} 分钟 · {len(secs)} 页 · 语速 {cps} 字/秒"
+              + (f" · 从母版 {v['from']} 压缩" if master else ""))
+    targets = pages or (sorted(secs) if v else range(1, n + 1))
     print(f"逐页模式：源文档切成 {len(chunks)} 块，生成 {len(targets)} 页…")
+    total_chars = 0
     for i in targets:
         pg = slides[i - 1]
-        floor = page_floor(pg["sec"], lo)
         page = "\n".join([pg["title"], *pg["text"]]).strip()
         notes = "\n".join(pg["notes"]) if pg.get("notes") else "（无）"
         src_seg = relevant(chunks, page) if chunks else ""
         prev = narr.get(str(i - 1), "")
-        grounded = "\n".join([brief, page, notes, src_seg, prev])   # 数字溯源依据（含口径表）
         disc = pg.get("disc", False)
+        grounded = "\n".join([brief, page, notes, src_seg, prev])   # 数字溯源依据（含口径表）
+        if v:
+            c = chars_for(secs[i], cps)
+            lo_i, hi_i = int(c * 0.9), int(c * 1.1)
+            total_chars += c
+        else:
+            lo_i, hi_i = page_floor(pg["sec"], lo), None
         system = NARRATE_SYSTEM.format(
             disclaimer=DISCLAIMER if disc else "本页不涉及财务预测，不要说免责语。",
             brief=brief or "（无场景卡）")
@@ -745,23 +1118,56 @@ def cmd_narrate(out, slides, source=None, pages=None, mode="auto", lo=100, hi=18
                 f"【当前页·画面】\n{page}\n\n" +
                 f"【当前页·讲述要点】\n{notes}\n\n" +
                 f"【源文档相关段落】\n{src_seg or '（无）'}")
-        text = llm(system, user).strip().strip('"“”')
+        if master and master.get(str(i)):
+            grounded += "\n" + master[str(i)]          # 母版文本也算依据，防压缩时改数字
+            user = (f"【任务】把【原稿】压缩为 {lo_i}–{hi_i} 字，用于更短的视频版本。"
+                    "保留核心判断和最重要的依据，按【讲述要点】的顺序取舍。"
+                    "不新增原稿中没有的事实，保留的数字一字不改。"
+                    "重新组织成连贯的段落，不要逐句删减。\n\n"
+                    f"【原稿】\n{master[str(i)]}\n\n"
+                    f"【当前页：第 {i}/{n} 页】\n标题：{pg['title']}\n"
+                    f"讲述要点：{notes}\n\n"
+                    f"【字数】{lo_i}–{hi_i} 字")
+        elif v:
+            user += (f"\n\n【字数】{lo_i}–{hi_i} 字。字数有限时按讲述要点的顺序取舍，"
+                     "优先讲前面的；宁可少讲一条，也不要每条都一笔带过。")
+        img = Path(out, "slides", f"{i:03d}.png") if vision else None
+        if img is not None and not img.exists():
+            print(f"    ⚠ 第 {i} 页找不到截图 {img.name}，本页退回文字模式")
+            img = None
+        if img is not None:
+            user += "\n\n【当前页截图】已附图片，可参考图中的图表和数据，但解说中不要提及画面。"
+        text = llm(system, user, img).strip().strip('"“”')
         for attempt in range(2):
-            iss = lint(text, floor, grounded, disc=disc)
+            iss = lint(text, lo_i, grounded, disc=disc)
+            if v:                       # 版本模式才管上限，且放宽到 OVER_TOL 倍（内容优先）
+                got_n = len(re.sub(r"\s", "", text))
+                if got_n > hi_i * OVER_TOL:
+                    iss.append(f"字数超出上限（{got_n} > {hi_i}）")
+            if vision:
+                # 看图模式：模型可能从图片里读出数字，而脚本核验不了图片 → 只提醒，不退回重写
+                num = [x for x in iss if x.startswith("数字无出处")]
+                if num:
+                    print(f"    ⚠ 第 {i} 页数字可能来自图片，请人工核对：{num[0].split('：', 1)[-1]}")
+                iss = [x for x in iss if not x.startswith("数字无出处")]
             if not iss:
                 break
             print(f"    ⚠ 第 {i} 页 {iss} → 重写 {attempt + 1}/2")
             rewrite = llm(system, f"【当前页·画面】\n{page}\n\n【当前页·讲述要点】\n{notes}\n\n"
                                    f"【本页解说·草稿】\n{text}\n\n【问题】\n" + "\n".join(iss) +
-                                   "\n\n请重写这一页解说词，只输出正文。").strip().strip('"“”')
+                                   "\n\n请重写这一页解说词，只输出正文。", img).strip().strip('"“”')
             if rewrite:
                 text = rewrite
         narr[str(i)] = text
         save()                                                    # 每页都存，中断不丢进度
-        print(f"  ✔ 第 {i:2d} 页  {len(text)} 字（下限 {floor}）")
+        print(f"  ✔ 第 {i:2d} 页  {len(text)} 字"
+              + (f"（目标 {lo_i}–{hi_i}）" if v else f"（下限 {lo_i}）"))
 
-    miss = [i for i in range(1, n + 1) if not narr.get(str(i))]
+    miss = [i for i in range(1, n + 1) if i in (sorted(secs) if v else range(1, n + 1))
+            and not narr.get(str(i))]
     print("已写入 narrations.json" + (f"，缺少第 {miss} 页" if miss else ""))
+    if v:
+        print(f"版本 {v['name']}：计划总字数约 {total_chars}，目标 {v['minutes']} 分钟")
     if rv.exists():
         if pages:
             update_review(rv, narr, pages)
@@ -770,31 +1176,41 @@ def cmd_narrate(out, slides, source=None, pages=None, mode="auto", lo=100, hi=18
             # 全量重生成：把 review.md 的解说词同步为新 narrations.json（保留原配置头），
             # 避免 build 读到旧解说词（build 以 review.md 为准）。
             cfg, _ = parse_review(rv)
-            write_review(rv, slides, narr, cfg)
+            write_review(rv, slides, narr, cfg, skip=(v["skip"] if v else ()),
+                         slides_dir=Path(out, "slides"))
             print("已同步 review.md 为新解说词（保留原配置），可直接 build")
 
 
-def cmd_review(deck, out, slides, reset, start):
-    write_outline(out, slides)
-    render(deck, out, len(slides), start)
-    rv = Path(out, "review.md")
+def cmd_review(deck, out, slides, reset, start, v=None):
+    tdir = v["dir"] if v else Path(out)          # 解说词/审稿文档随版本走，画面各版本共用
+    write_outline(tdir, slides)
+    is_html = Path(deck).suffix.lower() in (".html", ".htm")
+    if is_html:                                        # 导入的 PPTX/PDF 已在 import 时截过图
+        render(deck, out, len(slides), start)
+    rv = tdir / "review.md"
     if rv.exists() and not reset:
-        print("已重新截图，保留现有 review.md（加 --reset 可重新生成）")
+        print(("已重新截图，" if is_html else "已更新 outline.md，") + "保留现有 review.md（加 --reset 可重新生成）")
         return
-    nj = Path(out, "narrations.json")
+    nj = tdir / "narrations.json"
     narr = json.loads(nj.read_text(encoding="utf-8")) if nj.exists() else {}
-    write_review(rv, slides, narr, DEFAULTS)
+    write_review(rv, slides, narr, DEFAULTS, skip=(v["skip"] if v else ()),
+                 slides_dir=Path(out, "slides"))
     print(f"已生成 {rv}，修改确认后运行 build")
 
 
-def mux(out, mode, total, fontdir=None):
+def mux(out, cfg, total, fontdir=None, name="final-video.mp4"):
+    mode = cfg.get("subtitles", "burn")
     if mode == "burn" and not has_libass():
         print("⚠ 当前 ffmpeg 不支持 subtitles 滤镜，改为软字幕")
         mode = "soft"
-    vf = ("fps=30,scale=1920:1080:force_original_aspect_ratio=decrease,"
-          "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
+    # frame=letterbox：画面压到 960 高、贴顶，底部留 120px 黑边给字幕（导入的旧 PPT 用）
+    box = 960 if cfg.get("frame") == "letterbox" else 1080
+    y = "0" if box < 1080 else "(oh-ih)/2"
+    vf = (f"fps=30,scale=1920:{box}:force_original_aspect_ratio=decrease,"
+          f"pad=1920:1080:(ow-iw)/2:{y}:color={cfg.get('pad_color', 'black')},format=yuv420p")
     if mode == "burn":
-        style = "FontName=Noto Sans SC,FontSize=15,Outline=1.2,Shadow=0,MarginV=24"
+        margin = 8 if box < 1080 else 24
+        style = f"FontName=Noto Sans SC,FontSize=15,Outline=1.2,Shadow=0,MarginV={margin}"
         fontsdir = f":fontsdir={fontdir}" if fontdir else ""
         vf += f",subtitles=subs.srt{fontsdir}:force_style='{style}'"
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-stats",
@@ -808,13 +1224,14 @@ def mux(out, mode, total, fontdir=None):
     #     ffmpeg 会补一次默认时长 → 最后一页被播两遍（实测 24.67s 的日志出 30.57s 的视频）。
     cmd += ["-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-tune", "stillimage",
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-            "-t", f"{total:.3f}", "final-video.mp4"]
+            "-t", f"{total:.3f}", name]
     subprocess.run(cmd, cwd=out, check=True)
-    print(f"\n完成：{Path(out, 'final-video.mp4')}（{total / 60:.1f} 分钟）")
+    print(f"\n完成：{Path(out, name)}（{total / 60:.1f} 分钟）")
 
 
-def cmd_build(out, slides):
-    rv = Path(out, "review.md")
+def cmd_build(out, slides, v=None):
+    tdir = v["dir"] if v else Path(out)          # 解说词/中间件/成片随版本走；画面和缓存共用
+    rv = tdir / "review.md"
     if not rv.exists():
         sys.exit("先运行 review")
     cfg, pages = parse_review(rv)
@@ -830,7 +1247,10 @@ def cmd_build(out, slides):
         PRON.update(json.loads(pf.read_text(encoding="utf-8")))
     tts = QwenTTS(cfg) if cfg["backend"] == "qwen" else EdgeTTS(cfg)
     print(f"配音模式: {'克隆 ' + tts.ref_audio if getattr(tts, 'clone', False) else '预置音色 ' + cfg['speaker']}")
-    cache = Path(out, "tts-cache"); cache.mkdir(exist_ok=True)
+    cache = Path(out, "tts-cache"); cache.mkdir(exist_ok=True)   # 各版本共用：同句只合成一次
+    secs = allocate(slides, v["minutes"] * 60, v["skip"]) if v else None
+    if v:
+        print(f"版本 {v['name']}：目标 {v['minutes']} 分钟 · {len(secs)} 页")
     silence = lambda s: np.zeros(int(round(s * SR)), dtype=np.int16)
 
     track, cues, ffc, t = [], [], ["ffconcat version 1.0"], 0.0
@@ -851,58 +1271,82 @@ def cmd_build(out, slides):
         seg = np.concatenate(parts)
         dur = len(seg) / SR
         track.append(seg)
-        ffc += [f"file 'slides/{num:03d}.png'", f"duration {dur:.6f}"]
+        # 图片必须绝对路径：concat 文件在版本目录里，相对路径会解析到 versions/<名>/slides/
+        ffc += [f"file '{Path(out, 'slides', f'{num:03d}.png').resolve()}'", f"duration {dur:.6f}"]
         t += dur
-        sec = slides[num - 1].get("sec")
+        tgt = secs.get(num) if secs else slides[num - 1].get("sec")
         # 内容优先：比目标短（内容被砍）才告警；比目标长是信息量充足，正常。
-        warn = sec and dur / float(sec) < 0.8
-        print(f"  ✔ 第 {num:2d} 页  {dur:5.1f}s" + (f" / 目标 {sec}s" if sec else "")
+        warn = tgt and dur / float(tgt) < 0.8
+        print(f"  ✔ 第 {num:2d} 页  {dur:5.1f}s"
+              + (f" / 目标 {float(tgt):.0f}s" if tgt else "")
               + ("  ⚠ 偏短，可能漏内容" if warn else ""))
-    ffc.append(f"file 'slides/{pages[-1][0]:03d}.png'")   # concat 要求最后一帧重复一次
+    ffc.append(f"file '{Path(out, 'slides', f'{pages[-1][0]:03d}.png').resolve()}'")   # 末帧重复一次
     if speech:
-        print(f"实测语速 {chars / speech:.1f} 字/秒，可设 CPS={chars / speech:.1f}")
+        cps = chars / speech
+        print(f"实测语速 {cps:.2f} 字/秒")
+        Path(out, "cps.json").write_text(
+            json.dumps({"cps": round(cps, 2), "fingerprint": tts_fingerprint(cfg)},
+                       ensure_ascii=False, indent=2), encoding="utf-8")
+        print("已存入 cps.json（绑定后端/音色/语速；换音色或改 speed 会自动作废）")
+    if v:
+        tgt_total = v["minutes"] * 60
+        print(f"实际 {t / 60:.1f} 分钟 / 目标 {v['minutes']} 分钟（偏差 {t / tgt_total - 1:+.0%}）")
 
-    write_wav(Path(out, "narration.wav"), np.concatenate(track))
-    Path(out, "list.ffconcat").write_text("\n".join(ffc) + "\n", encoding="utf-8")
-    Path(out, "subs.srt").write_text(
+    write_wav(tdir / "narration.wav", np.concatenate(track))
+    (tdir / "list.ffconcat").write_text("\n".join(ffc) + "\n", encoding="utf-8")
+    (tdir / "subs.srt").write_text(
         "".join(f"{i}\n{ts(a)} --> {ts(b)}\n{c}\n\n" for i, (a, b, c) in enumerate(cues, 1)),
         encoding="utf-8")
     fontdir = Path(out).parent / "subtitles" / "fonts"
-    mux(out, cfg["subtitles"], t, str(fontdir) if fontdir.is_dir() else None)
+    mux(tdir, cfg, t, str(fontdir) if fontdir.is_dir() else None,
+        f"final-{v['name']}.mp4" if v else "final-video.mp4")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="HTML 幻灯片 → 配音讲解视频")
-    ap.add_argument("cmd", choices=["check", "narrate", "review", "build"])
-    ap.add_argument("deck", nargs="?", help="幻灯片 HTML 文件")
+    ap = argparse.ArgumentParser(description="幻灯片（HTML / PPTX / PDF）→ 配音讲解视频")
+    ap.add_argument("cmd", choices=["check", "import", "narrate", "review", "build"])
+    ap.add_argument("deck", nargs="?", help="幻灯片 HTML / PPTX / PDF 文件")
     ap.add_argument("--reset", action="store_true", help="review 时重新生成 review.md")
     ap.add_argument("--source", help="源文档（.md/.txt/.docx/.pdf…；非文本走 docreader）")
     ap.add_argument("--brief", help="场景卡 md（受众/用途/语气/主线），供解说定调")
     ap.add_argument("--pages", help="只重写指定页，如 3,5,7-9")
+    ap.add_argument("--vision", action="store_true",
+                    help="把每页截图一并发给模型（需多模态模型；图表/扫描页提取不到文字时用）")
     ap.add_argument("--mode", choices=["auto", "full", "page"], default="page")
     ap.add_argument("--length", default="100-180",
-                    help="无 data-sec 的页用此全局字数范围（有 data-sec 时按 时长×CPS 推算）")
+                    help="【单版本模式】无 data-sec 的页用此字数下限（有 data-sec 时按 时长×CPS 推算）；"
+                         "用 --version 时不生效，字数由版本总时长分配")
+    ap.add_argument("--version", help="versions.json 里的版本名（如 investor-10）；不传则走单版本流程")
     ap.add_argument("--hash-start", type=int, default=1,
-                    help="翻页 hash 起始编号（html-ppt 为 1，reveal.js 为 0）")
+                    help="翻页 hash 起始编号（html-ppt 为 1，reveal.js 为 0；仅 HTML 用）")
     a = ap.parse_args()
     if a.cmd == "check":
         return cmd_check()
     if not a.deck:
-        ap.error("需要指定幻灯片 HTML 文件")
+        ap.error("需要指定幻灯片文件（HTML / PPTX / PDF）")
     deck = str(Path(a.deck).resolve())
-    out = Path(deck).parent / "video-output"
+    is_html = Path(deck).suffix.lower() in (".html", ".htm")
+    # PPTX/PDF 各用一个 <文件名>-video/，同一个目录里放多份幻灯片也不会互相覆盖
+    out = Path(deck).parent / ("video-output" if is_html else f"{Path(deck).stem}-video")
     out.mkdir(exist_ok=True)
-    slides = extract(deck)
+    if a.cmd == "import":
+        if a.version:
+            print("⚠ import 与版本无关，--version 被忽略")
+        if is_html:
+            return print("HTML 不需要 import（review 时直接截图）")
+        return cmd_import(deck, out)
+    v = load_version(deck, out, a.version) if a.version else None
+    slides = load_slides(deck, out)
     if not slides:
-        sys.exit('没找到 <section class="slide">')
+        sys.exit('没找到幻灯片：HTML 需要 <section class="slide">；PPTX/PDF 请确认是幻灯片版式')
     if a.cmd == "build":
-        return cmd_build(out, slides)
+        return cmd_build(out, slides, v)
     if a.cmd == "narrate":
         lo, hi = map(int, a.length.split("-"))
         pgs = parse_pages(a.pages, len(slides)) if a.pages else None
-        cmd_narrate(out, slides, a.source, pgs, a.mode, lo, hi, a.brief)
+        cmd_narrate(out, slides, v, a.source, pgs, a.mode, lo, hi, a.brief, a.vision)
     else:
-        cmd_review(deck, out, slides, a.reset, a.hash_start)
+        cmd_review(deck, out, slides, a.reset, a.hash_start, v)
 
 
 if __name__ == "__main__":
