@@ -412,7 +412,10 @@ def test_capacity_table_columns_rows_and_cells():
     # 每格 > 12 字 → WARN
     long_cell = _page("表格(2 列，表头 + 2 行)（模板 table.html）",
                       ["表头：A · B", "这是一个超过十二个字的很长的格 · 短"])
-    assert any("每格约 12 字" in x[1] for x in m.capacity_issues(long_cell))
+    iss2 = m.capacity_issues(long_cell)
+    assert any("格超过容量" in x[1] for x in iss2)
+    # 预警要给出该列数/行数下的具体字数（2 列 × 2 行 → 一行 25 字 × 3 行 = 75 字）
+    assert any("每格约" in x[1] for x in iss2)
 
 
 def test_capacity_geometry_matches_measured_constants():
