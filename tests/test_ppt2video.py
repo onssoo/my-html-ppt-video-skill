@@ -245,3 +245,22 @@ def test_inherit_prev_unique_title_only():
     same = [{"title": "甲", "sec": None, "notes": []}, {"title": "乙", "sec": None, "notes": []}]
     nt2, np2, miss2 = m.inherit_prev(same, [{"title": "甲", "sec": 12}, {"title": "丙", "sec": 30}])
     assert nt2 == 1 and np2 == 1 and miss2 == []
+
+
+# ── 重录标记真正生效（reviewer 一.3）──────────────────────
+def test_redo_clears_that_pages_cache_only(tmp_path):
+    """标了重录的页，其句子缓存被删；其他页不受影响。"""
+    import json as _json
+    cache = tmp_path / "tts-cache"; cache.mkdir()
+    tts = type("T", (), {"key": ["qwen-clone", "/m", "/v.wav", "hash", "文本"]})()
+    a = m.cache_key(tts, "第一页的句子。")
+    b = m.cache_key(tts, "第二页的句子。")
+    for h in (a, b):
+        (cache / f"{h}.wav").write_bytes(b"x")
+        (cache / f"{h}_x1.15.wav").write_bytes(b"x")     # atempo 变速副本
+    # 模拟 build 里对第 1 页做的事
+    for sp in ["第一页的句子。"]:
+        for f in cache.glob(m.cache_key(tts, sp) + "*.wav"):
+            f.unlink()
+    assert not list(cache.glob(a + "*"))                  # 第 1 页清干净（含变速副本）
+    assert len(list(cache.glob(b + "*"))) == 2            # 第 2 页原样

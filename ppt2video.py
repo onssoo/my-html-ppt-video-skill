@@ -665,11 +665,16 @@ def synth_retry(tts, text, path, tries=3):
             time.sleep(wait)
 
 
+def cache_key(tts, text):
+    """一句音频的缓存键：与音色、后端、语速、读音规则、参考录音内容绑定。"""
+    return hashlib.sha1(json.dumps(tts.key + [text], ensure_ascii=False).encode()).hexdigest()[:16]
+
+
 def cached_many(tts, texts, cache):
     """返回 texts 对应的 wav 路径列表；未命中的句子**一次 batch** 合成。"""
     paths, miss = [], []
     for t in texts:
-        h = hashlib.sha1(json.dumps(tts.key + [t], ensure_ascii=False).encode()).hexdigest()[:16]
+        h = cache_key(tts, t)
         p = cache / f"{h}.wav"
         paths.append(p)
         if not p.exists():
@@ -689,7 +694,7 @@ def cached_many(tts, texts, cache):
 
 
 def cached(tts, text, cache):
-    h = hashlib.sha1(json.dumps(tts.key + [text], ensure_ascii=False).encode()).hexdigest()[:16]
+    h = cache_key(tts, text)
     p = cache / f"{h}.wav"
     if not p.exists():
         synth_retry(tts, text, p)
@@ -1495,6 +1500,15 @@ def cmd_build(out, slides, v=None, deck=None, force=False):
     rv = tdir / "review.md"
     if not rv.exists():
         sys.exit("先运行 review")
+    _rf = tdir / "redo.json"
+    redo = set()
+    if _rf.exists():
+        try:
+            redo = {int(k) for k in json.loads(_rf.read_text(encoding="utf-8"))}
+        except Exception:
+            redo = set()
+        if redo:
+            print(f"重录标记：第 {sorted(redo)} 页 —— 会清掉这些页的句子缓存再合成")
     cfg, pages = parse_review(rv)
     _njd = json.loads(nj.read_text(encoding="utf-8")) if nj.exists() else {}
     _diff = [n for n, x in pages if _njd.get(str(n), "").strip() != (x or "").strip()]
@@ -1522,6 +1536,10 @@ def cmd_build(out, slides, v=None, deck=None, force=False):
         parts, cur = [silence(LEAD)], LEAD
         seg_list = sentences(text)
         spoken = [speak(s) for s in seg_list]          # TTS 读口语；字幕仍用书面 s
+        if num in redo:                                  # 重录页：删掉句子缓存（含变速副本）
+            for _sp in spoken:
+                for _f in cache.glob(cache_key(tts, _sp) + "*.wav"):
+                    _f.unlink()
         for s, wavp in zip(seg_list, cached_many(tts, spoken, cache)):
             a = read_wav_sped(wavp, float(cfg.get("speed", 1.0) or 1.0), cache)
             d = len(a) / SR
@@ -1561,6 +1579,9 @@ def cmd_build(out, slides, v=None, deck=None, force=False):
         "".join(f"{i}\n{ts(a)} --> {ts(b)}\n{c}\n\n" for i, (a, b, c) in enumerate(cues, 1)),
         encoding="utf-8")
     fontdir = Path(out).parent / "subtitles" / "fonts"
+    if redo and _rf.exists():                      # 用过即归档，避免下次又整页重录
+        _rf.rename(tdir / f"redo-{time.strftime('%Y%m%d-%H%M%S')}.json")
+        print("重录标记已归档")
     mux(tdir, cfg, t, str(fontdir) if fontdir.is_dir() else None,
         f"final-{v['name']}.mp4" if v else "final-video.mp4")
 
