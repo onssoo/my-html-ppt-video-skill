@@ -1351,74 +1351,99 @@ def cmd_build(out, slides, v=None):
 # Gate 3 成片 → 质检报告（时长/逐页偏差/字幕/音量/重录表）
 
 def cmd_outline(path, out_path=None):
-    """Gate 1：把 outline.json 渲染成可审的大纲审定稿，并给出每页时长与字数预算。"""
-    oj = Path(path)
-    if not oj.exists():
-        sys.exit(f"没有 {oj}")
+    """Gate 1：大纲 → 审核报告 + 预检。
+
+    格式与密度规则**以 owner 的规范为准**（business-deck-spec.md §一 方法论/大纲格式、
+    §二 信息密度）。规范没有要求这套自动检查——`outline_preflight` 是我加的便利校验，
+    ERROR 必须改，WARN 请人确认。`.md` 是主路径；`.json` 仅保留给旧产物。
+    """
+    src = Path(path)
+    if not src.exists():
+        sys.exit(f"没有 {src}")
+
+    if src.suffix.lower() in (".md", ".markdown"):
+        parsed = parse_outline_md(src.read_text(encoding="utf-8"))
+        src_text = None
+        m = re.search(r"^-\s*素材\s*[：:]\s*(.+)$", parsed["preamble"], re.M)
+        if m:
+            cand = src.parent / m.group(1).strip().strip("`")
+            if cand.exists():
+                src_text = cand.read_text(encoding="utf-8", errors="ignore")
+        issues = outline_preflight(parsed, src_text)
+        budget, cps, minutes = outline_md_budget(parsed)
+        by = {}
+        for i in issues:
+            by.setdefault(i["page"], []).append(i)
+        nerr = sum(i["level"] == "ERROR" for i in issues)
+        nwarn = sum(i["level"] == "WARN" for i in issues)
+        total = sum(p["sec"] or 0 for p in parsed["pages"])
+        L = ["# Gate 1 · 大纲审核报告", "",
+             f"- 大纲：`{src.name}`",
+             "- 依据：`business-deck-spec.md` §一（方法论 / 大纲格式）、§二（信息密度）",
+             f"- 目标时长：{minutes if minutes else '—'} 分钟 · 各页合计 **{total:.0f} 秒**"
+             + (f"（差 {total - minutes * 60:+.0f} 秒）" if minutes else ""),
+             f"- 字数公式 `sec × {cps}`，区间 0.8–1.3×（规范 §八 第 104/106 行）",
+             f"- 共 **{len(parsed['pages'])}** 页 · **ERROR {nerr}** · WARN {nwarn}", ""]
+        if by.get(None):
+            L += ["## 全局问题", ""] + [f"- **{x['level']}** {x['msg']}" for x in by[None]] + [""]
+        L += ["## 总览", "", "| 页 | 标题 | 版式 | 信息点 | 要点 | 秒 | 目标字数 | 问题 |",
+              "|---|---|---|---|---|---|---|---|"]
+        for pg, b in zip(parsed["pages"], budget):
+            ps = by.get(pg["n"], [])
+            flag = "❌" if any(x["level"] == "ERROR" for x in ps) else ("⚠" if ps else "✓")
+            title = pg["title"] + ("（非内容页，信息点不限）" if any(k in pg["title"] for k in NON_CONTENT) else "")
+            L.append(f"| P{pg['n']} | {title} | {pg['layout'][:26] or '—'} | "
+                     f"{pg['info_declared'] if pg['info_declared'] is not None else len(pg['info'])} | "
+                     f"{len(pg['notes'])} | {b['sec']:.0f} | {b['lo']}–{b['hi']} | {flag} |")
+        L += [""]
+        pages_with = [pg for pg in parsed["pages"] if by.get(pg["n"])]
+        if pages_with:
+            L += ["## 逐页问题", ""]
+            for pg in pages_with:
+                L.append(f"### P{pg['n']} · {pg['title']}")
+                L += [f"- **{x['level']}** {x['msg']}" for x in by[pg["n"]]]
+                L.append("")
+        L += ["## 人工审核要点（脚本查不了）", "",
+              "- 主线：各部分连起来，能否支撑开头那句主线",
+              "- 标题：每页标题单独读，是不是一个明确的判断（规范 §一 第 14 行）",
+              "- 讲述要点：是不是画面的**补充**（原因/条件/含义），有没有复述画面文字（规范 §一 第 33 行）",
+              "- 信息点：6–10 是否合理，有没有该拆页的（规范 §二 第 41 行）",
+              "- 时长：内容页 40–60 秒是否合理（规范 §一 第 11 行）", ""]
+        dest = Path(out_path) if out_path else src.parent / "大纲-审核报告.md"
+        dest.write_text("\n".join(L), encoding="utf-8")
+        print(f"大纲 {len(parsed['pages'])} 页 · 合计 {total:.0f} 秒 · ERROR {nerr} · WARN {nwarn}")
+        for i in [x for x in issues if x["level"] == "ERROR"][:12]:
+            print(f"  ✘ {'P%s ' % i['page'] if i['page'] else ''}{i['msg']}")
+        print(f"报告：{dest}")
+        return 1 if nerr else 0
+
+    # —— 旧路径：outline.json（仅兼容旧产物）——
     try:
-        o = json.loads(oj.read_text(encoding="utf-8"))
+        o = json.loads(src.read_text(encoding="utf-8"))
     except Exception as e:
         sys.exit(f"outline.json 解析失败：{e}")
     pages = o.get("pages") or []
     if not pages:
         sys.exit("outline.json 里没有 pages")
-    try:
-        minutes = float(o.get("minutes") or 0)
-    except (TypeError, ValueError):
-        sys.exit("outline.json 的 minutes 不是数字")
-    if not minutes:
-        sys.exit("outline.json 缺 minutes（目标总时长）")
-    # 借用版本模式的同一套分配逻辑：weight → sec 权重，fixed → 固定秒数
-    fake = [{"title": p.get("title", ""), "sec": p.get("weight"), "fixed": p.get("fixed"),
-             "disc": bool(p.get("disc")), "text": p.get("points", []), "notes": p.get("notes", [])}
-            for p in pages]
-    secs = allocate(fake, minutes * 60)
+    secs = allocate([{"title": p.get("title", ""), "sec": p.get("weight"), "fixed": p.get("fixed"),
+                      "disc": bool(p.get("disc")), "text": p.get("points", []),
+                      "notes": p.get("notes", [])} for p in pages],
+                    float(o.get("minutes") or 14) * 60)
     cps = float(os.environ.get("CPS", "4.5"))
-    L = [f"# {o.get('project', '（未命名）')} · 大纲审定稿", ""]
-    if o.get("goal"):
-        L += [f"**这份 PPT 要让人得到的判断**：{o['goal']}", ""]
-    L += [f"- 目标 **{minutes:g} 分钟** · {len(pages)} 页 · 受众：{o.get('audience', '—')} · 风格：{o.get('style', '—')}",
-          f"- 源文档：{o.get('source', '—')}",
-          f"- **怎么改**：改 `{oj.name}`，或用 `review-ui` 打开审核台逐页改（推荐）。",
-          f"- 权重是**相对权重**（大的页分到更多时间）；固定秒数不参与缩放；字数目标由 `allocate`/`chars_for` 算出。", ""]
-    # 按章分组
-    order, groups = [], {}
+    L = [f"# {o.get('project', '（未命名）')} · 大纲审定稿（旧 json 格式，建议改用 大纲.md）", ""]
     for i, p in enumerate(pages, 1):
-        c = p.get("chapter") or "（未分章）"
-        if c not in groups:
-            groups[c] = []
-            order.append(c)
-        groups[c].append(i)
-    for c in order:
-        ids = groups[c]
-        sub = sum(secs[i] for i in ids)
-        L += ["", f"## {c}　（{len(ids)} 页 · {sub / 60:.1f} 分钟）", "",
-              "| 页 | 标题 | 权重 | 固定 | 时长 | 目标字数 |", "|---|---|---|---|---|---|"]
-        for i in ids:
-            p, cc = pages[i - 1], chars_for(secs[i], cps)
-            L.append(f"| {i} | {p.get('title', '')} | {p.get('weight') or ''} | {p.get('fixed') or ''} | "
-                     f"{'✓' if p.get('disc') else ''} | {secs[i]:.0f}s | {int(cc * 0.9)}–{int(cc * 1.1)} |")
-        L += [""]
-        for i in ids:
-            p = pages[i - 1]
-            L += [f"### 第 {i} 页 · {p.get('title', '')}", ""]
-            if p.get("point"):
-                L += [f"**核心观点**：{p['point']}", ""]
-            if p.get("support"):
-                L += ["**支撑材料**", ""] + [f"- {x}" for x in p["support"]] + [""]
-            if p.get("layout"):
-                L += [f"**呈现方式**：{p['layout']}", ""]
-            if p.get("dropped"):
-                L += [f"**取舍**：{p['dropped']}", ""]
-            if p.get("notes"):
-                L += ["**讲述要点（降序）**", ""] + [f"{k}. {x}" for k, x in enumerate(p["notes"], 1)] + [""]
-    tot = sum(chars_for(s, cps) for s in secs.values())
-    L += ["", "---", "", f"合计目标字数 **{tot}** ≈ {tot / cps / 60:.1f} 分钟纯语音"
-                       f"（差额是页首尾留白与句间停顿，成片约 {minutes:g} 分钟）"]
-    dest = Path(out_path) if out_path else oj.with_name("大纲-审定.md")
+        c = chars_for(secs[i], cps)
+        L += [f"## P{i} {p.get('title', '')}", "",
+              f"- 版式：{p.get('layout', '')}", f"- 时长：{secs[i]:.0f} 秒",
+              f"- 目标字数：{int(c * 0.9)}–{int(c * 1.1)}", ""]
+        if p.get("support"):
+            L += ["- 支撑材料："] + [f"  - {x}" for x in p["support"]] + [""]
+        if p.get("notes"):
+            L += ["- 讲述要点："] + [f"  {k}. {x}" for k, x in enumerate(p["notes"], 1)] + [""]
+    dest = Path(out_path) if out_path else src.with_name("大纲-审核报告.md")
     dest.write_text("\n".join(L), encoding="utf-8")
-    print(f"已写入 {dest}：{len(pages)} 页 · 目标 {minutes:g} 分钟 · 合计约 {tot} 字")
-
+    print(f"已写入 {dest}：{len(pages)} 页")
+    return 0
 
 def cmd_deck_pdf(deck, out_path=None):
     """Gate 2：把 out/slides/*.png 拼成一份 PDF——像 PPT 一样翻着审。"""
@@ -1604,150 +1629,238 @@ def _outline_budget(o, cps=None):
 
 OUTLINE_MD = "大纲.md"
 
+# 大纲格式以 owner 的规范为准（business-deck-spec.md §一 第 17–30 行的示例）：
+#   ## P5 <结论式标题 ≤30 字>
+#   - 版式：KPI 条(3) + 双栏要点(3+3) + 结论框
+#   - 信息点（10）：
+#     1. …
+#   - 时长：45 秒
+#   - 讲述要点（3–5 条，每条注明出处）：
+#     1. …（§3.1）
+# 本文件只解析这几个标记；其余内容原样保留、不解释。
+RE_PAGE_MD = re.compile(r"^##\s*P\s*(\d+)\s*[.、:：]?\s*(.+?)\s*$")
+RE_PAGE_COMPAT = re.compile(r"^###\s*第\s*(\d+)\s*页\s*[·:：]\s*(.+?)\s*$")   # 旧格式，兼容读取
+RE_SEC = re.compile(r"\*{0,2}时长\*{0,2}\s*[：:]\s*(\d+(?:\.\d+)?)\s*秒")
+RE_INFO_HDR = re.compile(r"\*{0,2}信息点\*{0,2}\s*[（(]\s*(\d+)\s*[)）]\s*[：:]?")
+RE_ITEM_NUM = re.compile(r"^\s*(?:\d+[.、)）]|[-*])\s+(.+)$")
+RE_CITE = re.compile(r"[（(]\s*(?:§|第)[^）)]*[）)]")            # 出处标注：（§3.1）/（第 3 页）
+NON_CONTENT = ("封面", "目录", "章节", "结尾", "封底", "致谢")
+
+
+def _md_field(chunk, *names):
+    """取 `- 名称：值` 或 `- **名称**：值` 的值。"""
+    for nm in names:
+        m = re.search(rf"^-\s*\*{{0,2}}{nm}\*{{0,2}}\s*[：:]\s*(.*)$", chunk, re.M)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _md_list(chunk, *names):
+    """取某个字段下面的编号/项目列表。"""
+    for nm in names:
+        m = re.search(rf"^-\s*\*{{0,2}}{nm}\*{{0,2}}[^\n]*[：:]\s*$", chunk, re.M)
+        if not m:
+            continue
+        rest = chunk[m.end():]
+        out = []
+        for ln in rest.split("\n"):
+            if not ln.strip():
+                if out:
+                    break
+                continue
+            if ln.lstrip().startswith("-"):        # 遇到下一个字段（`- xxx：`）就停
+                break
+            im = RE_ITEM_NUM.match(ln)
+            if im:
+                out.append(im.group(1).strip())
+            elif out and ln[:1] in (" ", "\t"):
+                out[-1] += " " + ln.strip()
+            else:
+                break
+        return out
+    return []
+
 
 def parse_outline_md(text):
-    """拆成 前言 / 各部分 / 每页（每页保留原始 md 片段，便于原样写回）。"""
+    """按规范格式拆页（并兼容旧的 `### 第 NN 页 ·` 写法）。
+
+    每页保留原始 md 片段（chunk），审核台编辑后原样写回。
+    """
     lines = text.split("\n")
-    parts, pages, pre, i, n = [], [], [], 0, len(text.split("\n"))
+    n, pages, pre, i = len(lines), [], [], 0
     while i < n:
-        ln = lines[i]
-        mp = re.match(r"^##\s+第\s*(\d+)\s*部分\s*[·:：]\s*(.+?)\s*$", ln)
-        if mp:
-            role, k = "", i + 1
-            while k < n and not lines[k].strip():       # 跨过空行再找「这部分干什么」
-                k += 1
-            if k < n:
-                r = re.match(r"^>\s*这部分干什么\s*[：:]\s*(.+)$", lines[k].strip())
-                if r:
-                    role = r.group(1).strip()
-            parts.append({"idx": int(mp.group(1)), "name": mp.group(2).strip(), "role": role, "pages": []})
-            i += 1
-            continue
-        mg = re.match(r"^###\s+第\s*(\d+)\s*页\s*[·:：]\s*(.+?)\s*$", ln)
-        if mg:
+        m = RE_PAGE_MD.match(lines[i]) or RE_PAGE_COMPAT.match(lines[i])
+        if m:
             j = i + 1
-            while j < n and not re.match(r"^###\s+第\s*\d+\s*页", lines[j]) \
-                    and not re.match(r"^##\s+第\s*\d+\s*部分", lines[j]):
+            while j < n and not RE_PAGE_MD.match(lines[j]) and not RE_PAGE_COMPAT.match(lines[j]):
                 j += 1
             chunk = "\n".join(lines[i:j]).rstrip()
-            num, title = int(mg.group(1)), mg.group(2).strip()
-            w = re.search(r"\*\*页长\*\*\s*[：:]\s*权重\s*(\d+)", chunk)
-            f = re.search(r"\*\*页长\*\*\s*[：:]\s*固定\s*(\d+)\s*秒", chunk)
-            d = re.search(r"\*\*免责\*\*\s*[：:]\s*(是|否)", chunk)
-            pages.append({"n": num, "title": title, "chunk": chunk, "part": parts[-1]["name"] if parts else "",
-                          "weight": int(w.group(1)) if w else None,
-                          "fixed": int(f.group(1)) if f else None,
-                          "disc": bool(d and d.group(1) == "是")})
-            if parts:
-                parts[-1]["pages"].append(num)
+            no, title = int(m.group(1)), m.group(2).strip()
+            sec = RE_SEC.search(chunk)
+            decl = RE_INFO_HDR.search(chunk)
+            pages.append({
+                "n": no, "title": title, "chunk": chunk, "part": "",
+                "layout": _md_field(chunk, "版式", "骨架"),
+                "sec": float(sec.group(1)) if sec else None,
+                "info": _md_list(chunk, r"信息点"),
+                "info_declared": int(decl.group(1)) if decl else None,
+                "notes": _md_list(chunk, r"讲述要点", r"演讲备注"),
+                "dropped": _md_field(chunk, "舍弃"),
+                "weight": None, "fixed": None, "disc": False,
+            })
             i = j
             continue
-        if not parts and not pages:
-            pre.append(ln)
+        if not pages:
+            pre.append(lines[i])
         i += 1
-    return {"preamble": "\n".join(pre).rstrip(), "parts": parts, "pages": pages}
-
-
-def replace_page_md(text, n, chunk):
-    """把第 n 页那一段替换掉，其他字节不动。n=0 表示文件头部（前言）。"""
-    lines, i, N = text.split("\n"), 0, len(text.split("\n"))
-    if n == 0:
-        for i, ln in enumerate(lines):
-            if re.match(r"^##\s+第\s*\d+\s*部分", ln):
-                return "\n".join(chunk.split("\n") + lines[i:])
-        return chunk
-    while i < N:
-        mg = re.match(r"^###\s+第\s*(\d+)\s*页\s*[·:：]", lines[i])
-        if mg and int(mg.group(1)) == n:
-            j = i + 1
-            while j < N and not re.match(r"^###\s+第\s*\d+\s*页", lines[j]) \
-                    and not re.match(r"^##\s+第\s*\d+\s*部分", lines[j]):
-                j += 1
-            return "\n".join(lines[:i] + chunk.split("\n") + lines[j:])
-        i += 1
-    return None
-
-
-def outline_md_budget(parsed, cps=None):
-    """大纲.md 的每页 → 分配秒数与字数区间（与出片同一套 allocate/chars_for）。"""
-    cps = cps or float(os.environ.get("CPS", "4.5"))
-    minutes = float(os.environ.get("OUTLINE_MINUTES", "14"))
-    m = re.search(r"目标时长\s*[：:]\s*([\d.]+)\s*分钟", parsed["preamble"])
-    if m:
-        minutes = float(m.group(1))
-    # 大纲阶段通常不写权重（时长是后面解说词阶段的事）：没权重的页按等权处理，别刷告警
-    fake = [{"title": p["title"], "sec": None if p["fixed"] else (p["weight"] or 45),
-             "fixed": p["fixed"], "disc": p["disc"], "text": [], "notes": []} for p in parsed["pages"]]
-    secs = allocate(fake, minutes * 60)
-    out = []
-    for p in parsed["pages"]:
-        c = chars_for(secs[p["n"]], cps)
-        out.append({"n": p["n"], "title": p["title"], "kind": p["part"], "weight": p["weight"],
-                    "fixed": p["fixed"], "disc": p["disc"], "sec": round(secs[p["n"]], 1),
-                    "lo": int(c * 0.9), "hi": int(c * 1.1)})
-    return out, cps, minutes
+    return {"preamble": "\n".join(pre).rstrip(), "parts": [], "pages": pages}
 
 
 def renumber_outline_md(text):
-    """按文档顺序把 `### 第 NN 页 ·` 重编成 1..N（页号只是序号标签）。"""
-    out, n = [], 0
+    """按文档顺序把页号重编成 P1..Pn。"""
+    out, k = [], 0
     for ln in text.split("\n"):
-        mo = re.match(r"^### 第\s*\d+\s*页\s*[·:：]\s*(.+)$", ln)
-        if mo:
-            n += 1
-            out.append(f"### 第 {n:02d} 页 · {mo.group(1)}")
+        m = RE_PAGE_MD.match(ln) or RE_PAGE_COMPAT.match(ln)
+        if m:
+            k += 1
+            out.append(f"## P{k} {m.group(2)}")
         else:
             out.append(ln)
     return "\n".join(out)
 
 
 def _page_span(lines, n):
-    """第 n 页在行数组里的 [起, 止) —— 到下一个 ### 页 或 ## 第 N 部分 为止。
-    注意：md 里的页号是补零的（`第 02 页`），所以要用 0* 吃掉前导零。"""
-    s = next((i for i, l in enumerate(lines)
-              if re.match(rf"^###\s+第\s*0*{n}\s*页\s*[·:：]", l)), None)
-    if s is None:
+    """第 n 页在行数组里的 [起, 止) —— 到下一页为止。"""
+    for i, l in enumerate(lines):
+        m = RE_PAGE_MD.match(l) or RE_PAGE_COMPAT.match(l)
+        if m and int(m.group(1)) == n:
+            j = i + 1
+            while j < len(lines) and not RE_PAGE_MD.match(lines[j]) and not RE_PAGE_COMPAT.match(lines[j]):
+                j += 1
+            return i, j
+    return None
+
+
+def replace_page_md(text, n, chunk):
+    """把第 n 页那一段替换掉，其他字节不动。n=0 表示文件头部。"""
+    lines = text.split("\n")
+    if n == 0:
+        for i, ln in enumerate(lines):
+            if RE_PAGE_MD.match(ln) or RE_PAGE_COMPAT.match(ln):
+                return "\n".join(chunk.split("\n") + lines[i:])
+        return chunk
+    sp = _page_span(lines, n)
+    if sp is None:
         return None
-    e = s + 1
-    while e < len(lines) and not re.match(r"^###\s+第\s*\d+\s*页", lines[e]) \
-            and not re.match(r"^##\s+第\s*\d+\s*部分", lines[e]):
-        e += 1
-    return s, e
+    s, e = sp
+    return "\n".join(lines[:s] + chunk.split("\n") + lines[e:])
 
 
 def outline_md_op(text, op, n=0):
-    """大纲结构操作：add（在第 n 页后加一页）/ del / up / down。返回新文本；不可行返回 None。"""
+    """大纲结构操作：add / del / up / down。返回新文本；不可行返回 None。"""
     p = parse_outline_md(text)
     nums = [x["n"] for x in p["pages"]]
-    if n not in nums and op != "add":
-        return None
     lines = text.split("\n")
     if op == "del":
-        s, e = _page_span(lines, n)
-        return renumber_outline_md("\n".join(lines[:s] + lines[e:]))
+        sp = _page_span(lines, n)
+        return renumber_outline_md("\n".join(lines[:sp[0]] + lines[sp[1]:])) if sp else None
     if op in ("up", "down"):
+        if n not in nums:
+            return None
         i = nums.index(n)
         j = i - 1 if op == "up" else i + 1
         if j < 0 or j >= len(nums):
             return None
         a, b = _page_span(lines, nums[i]), _page_span(lines, nums[j])
         (s1, e1), (s2, e2) = (a, b) if a[0] < b[0] else (b, a)
-        blk1, blk2 = lines[s1:e1], lines[s2:e2]
-        return renumber_outline_md("\n".join(lines[:s1] + blk2 + blk1 + lines[e2:]))
+        return renumber_outline_md("\n".join(lines[:s1] + lines[s2:e2] + lines[s1:e1] + lines[e2:]))
     if op == "add":
-        stub = ("### 第 00 页 · 新页\n"
-                "- **骨架**：`bullets.html`（信息点上限 6）\n"
-                "- **这页干什么**：\n"
-                "- **页面文字**：kicker `` ｜ 标题 `` ｜ 副标题 ``\n"
-                "- **信息点**：\n  1. \n"
-                "- **数据/数字**：\n"
-                "- **演讲备注**：\n  1. \n"
-                "- **舍弃**：\n")
-        if n in nums:                                   # 插在这一页后面（同属一个部分）
-            s, e = _page_span(lines, n)
-            return renumber_outline_md("\n".join(lines[:e] + stub.split("\n") + lines[e:]))
-        return renumber_outline_md(text.rstrip() + "\n\n" + stub)   # 没有 n 就追加到末尾
+        stub = ("## P00 新页（标题写成结论，≤30 字）\n"
+                "- 版式：\n"
+                "- 信息点（0）：\n  1. \n"
+                "- 时长：45 秒\n"
+                "- 讲述要点（3–5 条，每条注明出处）：\n  1. （§）\n")
+        if n in nums:
+            sp = _page_span(lines, n)
+            return renumber_outline_md("\n".join(lines[:sp[1]] + stub.split("\n") + lines[sp[1]:]))
+        return renumber_outline_md(text.rstrip() + "\n\n" + stub)
     return None
+
+
+def outline_md_budget(parsed, cps=None):
+    """每页 → 目标字数区间。
+
+    字数公式照规范 §八 第 104 行：`data-sec × CPS`（CPS 默认 4.5）；
+    区间照规范 §八 第 106 行：0.8–1.3×。
+    """
+    cps = cps or float(os.environ.get("CPS", "4.5"))
+    m = re.search(r"目标时长\s*[：:]\s*([\d.]+)\s*分钟", parsed["preamble"])
+    minutes = float(m.group(1)) if m else None
+    out = []
+    for p in parsed["pages"]:
+        sec = p["sec"] or 45
+        out.append({"n": p["n"], "title": p["title"], "kind": "", "weight": None,
+                    "fixed": None, "disc": False, "sec": sec,
+                    "lo": int(sec * cps * 0.8), "hi": int(sec * cps * 1.3)})
+    return out, cps, minutes
+
+
+def outline_preflight(parsed, src_text=None):
+    """Gate 1 预检。**注意：规范没有要求这套自动检查，这是我加的便利校验**
+    （规范只定义了格式与密度规则）。级别：ERROR 必须改，WARN 请人确认。"""
+    issues = []
+    add = lambda lv, msg, n=None: issues.append({"level": lv, "page": n, "msg": msg})
+    pages = parsed["pages"]
+    if not pages:
+        return [{"level": "ERROR", "page": None, "msg": "没解析到任何页：页标题要写成『## P5 结论式标题』"}]
+    nos = [p["n"] for p in pages]
+    if nos != list(range(1, len(pages) + 1)):
+        add("WARN", f"页号不连续：{nos}")
+    for k in ("受众", "目标时长", "主线", "素材"):
+        if not re.search(rf"^-\s*{k}\s*[：:]", parsed["preamble"], re.M):
+            add("WARN", f"文件开头缺『- {k}：』")
+    secs = [p["sec"] for p in pages]
+    if any(s is None for s in secs):
+        add("ERROR", f"有页缺『- 时长：N 秒』：{[p['n'] for p in pages if p['sec'] is None]}")
+    m = re.search(r"目标时长\s*[：:]\s*([\d.]+)\s*分钟", parsed["preamble"])
+    if m and all(secs):
+        total, want = sum(secs), float(m.group(1)) * 60
+        if abs(total - want) > want * 0.05:
+            add("WARN", f"各页时长合计 {total:.0f} 秒，与目标 {want:.0f} 秒差 {total - want:+.0f} 秒（规范 §一：相加应约等于总时长）")
+    src_nums = set(re.findall(r"\d[\d,]*(?:\.\d+)?", src_text)) if src_text else None
+    for p in pages:
+        n, t = p["n"], p["title"]
+        non_content = any(k in t for k in NON_CONTENT) or any(k in p["layout"] for k in NON_CONTENT)
+        if len(t) > 30:
+            add("WARN", f"标题 {len(t)} 字 > 30（规范 §一 第 14 行：≤30 字一行）", n)
+        if not p["layout"]:
+            add("ERROR", "缺『- 版式：』", n)
+        if not non_content:
+            cnt = p["info_declared"] if p["info_declared"] is not None else len(p["info"])
+            if not 6 <= cnt <= 10:
+                add("ERROR" if cnt > 10 else "WARN",
+                    f"信息点 {cnt} 个（规范 §二 第 41 行：内容页 6–10，>10 必须拆页）", n)
+            if p["info_declared"] is not None and p["info"] and p["info_declared"] != len(p["info"]):
+                add("ERROR", f"『信息点（{p['info_declared']}）』与实际 {len(p['info'])} 条不符", n)
+        k = len(p["notes"])
+        if not 3 <= k <= 5:
+            add("WARN", f"讲述要点 {k} 条（规范 §一 第 26 行：3–5 条）", n)
+        no_cite = [x for x in p["notes"] if not RE_CITE.search(x)]
+        if no_cite:
+            add("WARN", f"{len(no_cite)} 条讲述要点没注明出处（规范 §一 第 26 行要求每条注明）", n)
+        blob = "\n".join([t, p["layout"], p["chunk"]])
+        if re.search(r"免责|不构成.{0,8}(承诺|建议)|风险提示|声明.{0,4}性质", blob):
+            add("ERROR", "出现免责/声明类内容（owner 要求默认不加）", n)
+        if src_nums is not None:
+            blob = "\n".join([t] + p["info"])
+            blob = re.sub(r"[（(]\s*占\s*\d+\s*行\s*[)）]", "", blob)     # 计数标注不算数字
+            blob = RE_CITE.sub("", blob)
+            miss = [x for x in set(re.findall(r"\d[\d,]*(?:\.\d+)?", blob))
+                    if x not in src_nums and x.replace(",", "") not in src_nums]
+            if miss:
+                add("WARN", f"这些数字没在源文档里逐字查到：{', '.join(miss[:6])}", n)
+    return issues
 
 
 def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, open_browser=True):
@@ -1826,7 +1939,9 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                 "peak": f"{20 * np.log10(max(peak, 1e-6)):.1f} dBFS", "pages": pages}
 
     state = {}
-    omd = next((c for c in (work / OUTLINE_MD, work.parent / OUTLINE_MD) if c.exists()), None)
+    # 目标本身是 .md 就直接当大纲；否则按约定名在附近找
+    omd = tgt if tgt.suffix.lower() in (".md", ".markdown") else \
+        next((c for c in (work / OUTLINE_MD, work.parent / OUTLINE_MD) if c.exists()), None)
 
     def build_state():
         o, parsed = None, None
@@ -1943,6 +2058,11 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                     if not pages:
                         return self._send(400, b'{"error":"nothing to save"}')
                     for k, chunk in pages.items():
+                        head1 = (chunk or "").strip().split("\n")[0] if (chunk or "").strip() else ""
+                        if head1 and not (RE_PAGE_MD.match(head1) or RE_PAGE_COMPAT.match(head1)):
+                            return self._send(400, json.dumps(
+                                {"error": f"第 {k} 页的片段第一行必须是页头（规范格式：'## P{k} 结论式标题'），"
+                                          f"当前是：{head1[:40]}"}, ensure_ascii=False).encode())
                         new = replace_page_md(txt, int(k), (chunk or "").rstrip())
                         if new is None:
                             return self._send(400, json.dumps({"error": f"page {k} not found"}).encode())
@@ -2106,4 +2226,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -98,7 +98,7 @@
     <div id="o-fullwrap" class="card" style="display:none">
       <textarea id="o-full" rows="30" spellcheck="false"></textarea>
       <p class="hint">格式约定：每个部分写 <code>## 第 N 部分 · 名字</code>，跟着一行 <code>&gt; 这部分干什么：…</code>；
-        每页写 <code>### 第 NN 页 · 标题</code>。页号是序号，保存时会按顺序重编。</p>
+        每页写 <code>## P&lt;n&gt; 结论式标题</code>（规范格式）。页号是序号，保存时会按顺序重编。</p>
     </div>
   </section>
 
@@ -179,7 +179,7 @@ function tab(g) {
   ['outline', 'deck', 'narration', 'video'].forEach(k => $('#s-' + k).classList.toggle('on', k === g));
 }
 
-/* ───── ① 大纲（直接编辑 大纲.md：页数/标题/内容/骨架全可改） ───── */
+/* ───── ① 大纲（直接编辑 大纲.md：页数/标题/版式/信息点/时长全可改） ───── */
 function budgetFor(n) { return (ST.budget || []).find(b => b.n === n) || {}; }
 function mmss(s) { const t = Math.round(s), m = Math.floor(t / 60); return `${m} 分 ${t % 60} 秒`; }
 let oView = 'page', oDirty = false;
@@ -206,8 +206,10 @@ function renderOutline() {
   $('#o-fullwrap').style.display = oView === 'full' ? '' : 'none';
   if (oView === 'full') { $('#o-full').value = ST.outline_md_text || ''; return; }
   box.innerHTML = '';
-  M.parts.forEach(part => {
-    const ids = part.pages || [];
+  const groups = (M.parts && M.parts.length) ? M.parts.map(x => ({ name: x.name, role: x.role, ids: x.pages }))
+                                             : [{ name: '大纲', role: '', ids: (M.pages || []).map(x => x.n) }];
+  groups.forEach(part => {
+    const ids = part.ids || [];
     box.appendChild(el('div', { class: 'ch' }, [
       el('b', { text: part.name }), el('span', { class: 'sum', text: `${ids.length} 页` }),
       el('button', { class: 'ghost', 'data-addafter': ids.length ? ids[ids.length - 1] : 0, text: '+ 这部分末尾加一页' })
@@ -215,19 +217,20 @@ function renderOutline() {
     if (part.role) box.appendChild(el('p', { class: 'hint', text: '这部分干什么：' + part.role }));
     ids.forEach(n => {
       const p = (M.pages || []).find(x => x.n === n); if (!p) return;
-      const sk = (p.chunk.match(/\*\*骨架\*\*[：:]\s*`([^`]+)`/) || [])[1] || '内联 SVG 图';
+      const b = (ST.budget || []).find(x => x.n === n) || {};
+      const sk = p.layout ? p.layout.slice(0, 20) : '—';
       const ta = el('textarea', { rows: 8, 'data-md-n': n }); ta.value = p.chunk;
       box.appendChild(el('div', { class: 'pg' }, [
         el('div', { class: 'pg-h' }, [
           el('span', { class: 'pg-n', text: String(n).padStart(2, '0') }),
           el('input', { class: 'ttl', 'data-title-n': n, value: p.title, placeholder: '这页主标题（写结论）' }),
-          el('span', { class: 'badge', text: sk }),
+          el('span', { class: 'badge', text: `${sk} · ${p.sec || '?'}秒 · 信息点 ${p.info_declared ?? (p.info || []).length} · 要点 ${(p.notes || []).length}` }),
           el('button', { class: 'ghost', 'data-op': 'up', 'data-opn': n, text: '↑' }),
           el('button', { class: 'ghost', 'data-op': 'down', 'data-opn': n, text: '↓' }),
           el('button', { class: 'ghost', 'data-op': 'del', 'data-opn': n, text: '删' }),
           el('button', { class: 'ghost', 'data-addafter': n, text: '+ 加页' })
         ]),
-        el('details', {}, [el('summary', { text: '▸ 剧本正文（改：内容 / 骨架 / 信息点 / 数据 / 备注）' }), ta])
+        el('details', {}, [el('summary', { text: '▸ 正文（改：标题 / 版式 / 信息点 / 时长 / 讲述要点）' }), ta])
       ]));
     });
   });
@@ -244,7 +247,7 @@ $('#save-outline').onclick = () => {
     const n = t.dataset.mdN; let chunk = t.value;
     const ti = document.querySelector(`[data-title-n="${n}"]`);
     if (ti && ti.value.trim())
-      chunk = chunk.replace(/^###\s*第\s*\d+\s*页\s*[·:：].*$/m, `### 第 ${String(n).padStart(2, '0')} 页 · ${ti.value.trim()}`);
+      chunk = chunk.replace(/^##\s*P\s*\d+\s*.*$/m, `## P${n} ${ti.value.trim()}`);
     pages[n] = chunk;
   });
   return oSave({ pages });
