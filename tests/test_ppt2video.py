@@ -385,3 +385,39 @@ def test_deck_skeleton_requires_gate1(tmp_path):
     md.write_text(md.read_text(encoding="utf-8") + "\n<!-- 改过 -->\n", encoding="utf-8")
     assert m.cmd_deck_skeleton(str(md), str(sk)) == 2        # 通过后又改了 → 需重审
     assert m.cmd_deck_skeleton(str(md), str(sk), force=True) == 0   # owner 明确要求才可越过
+
+
+# ── 画布容量：设计阶段就要能算出「装不下」（不用渲染）──────────────
+def _page(layout, info, n=1, title="标题"):
+    return {"n": n, "title": title, "layout": layout, "info": info,
+            "notes": ["甲", "乙", "丙"], "sec": 30, "info_declared": len(info)}
+
+
+def test_capacity_table_columns_rows_and_cells():
+    # 5 列 → ERROR（规范 §二 第 43 行 /§三 第 61 行：表格 ≤4 列）
+    p = _page("表格(5 列，表头 + 3 行)（模板 table.html）",
+              ["表头：A · B · C · D · E"] + ["甲 · 乙 · 丙 · 丁 · 戊"] * 3)
+    lv = [x[0] for x in m.capacity_issues(p)]
+    assert "ERROR" in lv
+    # 8 行 + 图注 → 超出画布（几何上最多 7 行）；无图注 8 行可以
+    rows = ["甲 · 乙"] * 8
+    with_cap = _page("表格(2 列，表头 + 8 行)（模板 table.html）",
+                     ["表头：A · B"] + rows + ["图注：说明文字"])
+    assert any("行超出画布" in x[1] for x in m.capacity_issues(with_cap))
+    no_cap = _page("表格(2 列，表头 + 8 行)（模板 table.html）", ["表头：A · B"] + rows)
+    assert not any("行超出画布" in x[1] for x in m.capacity_issues(no_cap))
+    # 9 行 → ERROR
+    nine = _page("表格(2 列，表头 + 9 行)（模板 table.html）", ["表头：A · B"] + ["甲 · 乙"] * 9)
+    assert any(x[0] == "ERROR" and "行超出画布" in x[1] for x in m.capacity_issues(nine))
+    # 每格 > 12 字 → WARN
+    long_cell = _page("表格(2 列，表头 + 2 行)（模板 table.html）",
+                      ["表头：A · B", "这是一个超过十二个字的很长的格 · 短"])
+    assert any("每格约 12 字" in x[1] for x in m.capacity_issues(long_cell))
+
+
+def test_capacity_geometry_matches_measured_constants():
+    """几何常量要和实测一致：一行 71px、表头 76px、标题块 141px、上下留白 92px。"""
+    assert m.GEOM["box"]["td"] == 71.0 and m.GEOM["box"]["th"] == 76.0
+    assert m.GEOM["title"] == 141 and m.GEOM["pad_top"] + m.GEOM["pad_bottom"] == 92
+    # 表格高度模型：4 行 1 行文字 = 76 + 4×71（实测 362）
+    assert m.table_height([["A"] * 4] + [["甲"] * 4] * 4, 4) == 76 + 4 * 71

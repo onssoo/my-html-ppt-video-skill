@@ -2229,6 +2229,188 @@ def is_non_content(p, idx=None, total=None):
     return False
 
 
+
+# ─── 画布容量估算：设计阶段（Gate ①）就能算出「这页装不装得下」─────────────
+# 常量来源：dailei-business-deck 的 CSS 几何 + 规范 §三 的字号，
+# 并用 2026-10-07 的 30 页真实素材逐页实测标定（表格高度误差 ≤2px）。
+# 目的：**不要等渲染完才发现内容高于画布** —— 大纲阶段就算出来，改大纲而不是改 HTML。
+GEOM = {
+    "body": 922,          # 正文区（1080 − band 84 − foot 74）
+    "pad_top": 40,        # .bd-body 上内边距
+    "pad_bottom": 52,     # 字幕安全区留白（底部 120px − footer 74px + 6）
+    "title": 141,         # kicker 33 + h1 74 + rule 3 + 间距 31
+    "comp_margin": 24,    # 组件与标题块之间的间距（多数组件 20–28）
+    "line": {"table": 46.4, "th": 47.0, "body": 52.0, "caption": 38.0, "li": 46.0},
+    "box": {"th": 76.0, "td": 71.0, "cap": 12.0},   # 一行时的基准高（含 padding）
+    "font": {"table": 32, "body": 40, "label": 28, "caption": 28, "kpi": 88},
+}
+
+
+def text_width(t):
+    """估算字符串占宽（px）：CJK 按字号 1.0，ASCII 按 0.55。"""
+    w = 0.0
+    for ch in str(t):
+        w += 1.0 if ord(ch) > 0x2E7F else 0.55
+    return w
+
+
+def est_lines(text, width_px, font_px, limit=None):
+    """按可用宽度估算行数（至少 1）。"""
+    if not str(text).strip():
+        return 1
+    n = max(1, int(text_width(text) * font_px / max(width_px, 1)))
+    return min(n, limit) if limit else n
+
+
+def table_height(rows_items, ncol, avail_w=1728):
+    """表格自然高度（实测标定：一行 71px，每多一行 +46.4px；表头 76/123px）。
+
+    列宽是浏览器**按内容自动分配**的：先算每列理想宽，总和超画布就按比例压缩，
+    被压到放不下的格才会换行 —— 这是实测（2026-10-07，30 页真实素材）得到的规律，
+    等分列宽的估法会严重高估行数（平均误差 84px → 该模型 ≤ …）。"""
+    if not rows_items:
+        return 0.0
+    f = GEOM["font"]["table"]
+    colw = []
+    for j in range(ncol):
+        ideal = max([text_width(r[j]) * f for r in rows_items if j < len(r)] + [0.0]) + 44
+        colw.append(max(ideal, 80.0))
+    total = sum(colw)
+    scale = min(1.0, avail_w / total) if total else 1.0
+    colw = [w * scale for w in colw]
+
+    def lines_of(cells):
+        n = 1
+        for j, c in enumerate(cells):
+            room = max(colw[j] - 44, 20.0)
+            w = text_width(c) * f
+            n = max(n, 1 if w <= room else int(-(-w // room)))
+        return n
+
+    head, *body = rows_items
+    nl = [lines_of(r) for r in body]
+    h = GEOM["box"]["th"] + GEOM["line"]["th"] * (lines_of(head) - 1)
+    for n_ in nl:
+        h += GEOM["box"]["td"] + GEOM["line"]["table"] * (n_ - 1)
+    return h
+
+
+def estimate_page(page):
+    """估算一页的占用高度与余量（正数=还空着，负数=内容高于画布）。
+
+    返回 {"used":…, "slack":…, "note":…}；只做算术，不渲染。"""
+    layout = page.get("layout") or ""
+    info = [re.sub(r"（占 \d+ 行）\s*$", "", str(x)).strip() for x in page.get("info", [])]
+    used = GEOM["pad_top"] + GEOM["title"] + GEOM["comp_margin"] + GEOM["pad_bottom"]
+    note = ""
+
+    tpl = re.search(r"模板\s*([a-z-]+)\.html", layout)
+    tpl = tpl.group(1) if tpl else "table"
+    if tpl == "table":
+        head, rows, caps = [], [], []
+        for it in info:
+            m = re.match(r"^表头[：:]\s*(.+)$", it)
+            if m:
+                head = [x.strip() for x in m.group(1).split("·")]
+                continue
+            if re.match(r"^(图注|说明)[：:]", it):
+                caps.append(re.sub(r"^(图注|说明)[：:]\s*", "", it))
+                continue
+            if re.match(r"^(结论框|结论)[：:]", it):
+                continue
+            rows.append([x.strip() for x in it.split("·")])
+        ncol = max(len(head), max((len(r) for r in rows), default=1))
+        h = table_height(([head] if head else [[""] * ncol]) + rows, ncol)
+        if caps:
+            h += GEOM["box"]["cap"] + GEOM["line"]["caption"] * est_lines(
+                "；".join(caps), 1728, GEOM["font"]["caption"])
+        used += h
+        note = f"表 {ncol} 列 × {len(rows)} 行"
+    elif tpl == "chart":
+        used += 560 + 28 + GEOM["line"]["caption"] * 2
+        note = "图表固定高"
+    elif tpl in ("bullets",):
+        used += sum(GEOM["line"]["body"] * est_lines(x, 1600, GEOM["font"]["body"]) + 13 for x in info)
+        note = f"{len(info)} 条要点"
+    elif tpl in ("two-column", "comparison", "three-column"):
+        per = 1 if tpl == "two-column" else (2 if tpl == "comparison" else 3)
+        col_w = 1728 / per - 88
+        lines = sum(est_lines(x, col_w, GEOM["font"]["body"]) for x in info)
+        used += max(lines, 1) * GEOM["line"]["body"] / max(per, 1) + 120
+        note = f"{len(info)} 条 / {per} 栏"
+    elif tpl == "kpi-grid":
+        used += 300 + (GEOM["line"]["caption"] * 2 if len(info) > 4 else 0)
+        note = "KPI 条固定高"
+    elif tpl in ("end",):
+        used += GEOM["line"]["body"] * len(info) + 120
+    else:                                    # cover / toc / divider：满版，不受限
+        return {"used": 0, "slack": 999, "note": "满版页（不受正文高度限制）"}
+    return {"used": int(used), "slack": int(GEOM["body"] - used), "note": note}
+
+
+
+def capacity_issues(page):
+    """按规范 §三 第 61 行的容量表，在设计阶段就判定「这一页装不下」。
+
+    规范给的容量参考（这是 owner 定的设计预算，不是猜的）：
+      单栏正文每行约 40 字、约 12 行；双栏每栏每行约 18 字、约 10 行；
+      表格 ≤4 列、每格约 12 字、表头 + 8 行；KPI 条 3–4 个。
+    超了就按规范 §三 第 62 行的顺序处理：精简措辞 → 换版式 → 拆页。
+    返回 [(级别, 说明), …]。"""
+    out = []
+    layout = page.get("layout") or ""
+    info = [re.sub(r"（占 \d+ 行）\s*$", "", str(x)).strip() for x in page.get("info", [])]
+    tpl = re.search(r"模板\s*([a-z-]+)\.html", layout)
+    tpl = tpl.group(1) if tpl else ""
+    if tpl == "table":
+        head, rows, caps = [], [], []
+        for it in info:
+            m = re.match(r"^表头[：:]\s*(.+)$", it)
+            if m:
+                head = [x.strip() for x in m.group(1).split("·")]
+                continue
+            if re.match(r"^(图注|说明|结论框|结论)[：:]", it):
+                if re.match(r"^(图注|说明)[：:]", it):
+                    caps.append(re.sub(r"^(图注|说明)[：:]\s*", "", it))
+                continue
+            rows.append([x.strip() for x in it.split("·")])
+        ncol = max(len(head), max((len(r) for r in rows), default=1))
+        if ncol > 4:
+            out.append(("ERROR", f"表格 {ncol} 列 > 规范上限 4 列"))
+        # 行数上限按几何算，而不是照抄规范里的"8 行"——那个数**没算图注**。
+        # 实测（2026-10-07 真实素材）：正文可用 922 − 上下留白 92 − 标题块 141 − 组件间距 24 = 665px；
+        # 表头 76px、每行 71px、图注一行 50px（含间距）→ 有图注最多 7 行，无图注 8 行。
+        avail = GEOM["body"] - GEOM["pad_top"] - GEOM["pad_bottom"] - GEOM["title"] - GEOM["comp_margin"]
+        room = avail - GEOM["box"]["th"] - (50 if caps else 0)
+        max_rows = int(room // GEOM["box"]["td"])
+        if len(rows) > max_rows:
+            why = "（含图注）" if caps else ""
+            out.append(("ERROR" if len(rows) > max_rows + 1 else "WARN",
+                        f"表格 {len(rows)} 行超出画布{why}：几何上限 {max_rows} 行"
+                        f"（可用 {avail:.0f}px − 表头 76 − 图注 {50 if caps else 0}）→ 砍 "
+                        f"{len(rows) - max_rows} 行，或去掉图注，或按规范 §三 第 62 行换版式/拆页"))
+        over = [(len(c), c) for r in rows for c in r if len(c) > 12]
+        if over:
+            n, longest = max(over)
+            out.append(("WARN", f"{len(over)} 个格超过「每格约 12 字」（最长 {n} 字：{longest[:16]}…）"
+                                "—— 做 slides 时会被精简，建议直接在大纲里改短"))
+        if caps and sum(len(c) for c in caps) > 60:
+            out.append(("WARN", f"图注合计 {sum(len(c) for c in caps)} 字 > 一行约 60 字"
+                                "—— 画面上只放一行，建议精简或合并"))
+    elif tpl in ("bullets", "two-column"):
+        per = 1 if tpl == "bullets" else 2
+        cpl = 40 if per == 1 else 18
+        lines = sum(max(1, int(-(-len(x) // cpl))) for x in info)
+        cap_lines = (12 if per == 1 else 10) * per
+        if lines > cap_lines:
+            out.append(("WARN", f"正文约 {lines} 行 > 容量 {cap_lines} 行（每行约 {cpl} 字）"))
+    elif tpl == "kpi-grid":
+        n = len([x for x in info if re.search(r"\d", x)])
+        if n > 4:
+            out.append(("WARN", f"KPI 条 {n} 个 > 规范 3–4 个"))
+    return out
+
+
 def outline_preflight(parsed, src_text=None):
     """Gate 1 预检。**注意：规范没有要求这套自动检查，这是我加的便利校验**
     （规范只定义了格式与密度规则）。级别：ERROR 必须改，WARN 请人确认。"""
@@ -2272,6 +2454,9 @@ def outline_preflight(parsed, src_text=None):
         no_cite = [x for x in p["notes"] if re.search(r"\d", x) and not RE_CITE.search(x)]
         if no_cite:
             add("WARN", f"{len(no_cite)} 条含数字的讲述要点没注明出处（§一 第 26 行；出处只写在幕后要点，不进画面）", n)
+        # 画布容量（规范 §三 第 61 行的容量表）：设计阶段就判定这页装不装得下
+        for _lv, _msg in capacity_issues(p):
+            add(_lv, _msg, n)
         blob = "\n".join([t, p["layout"], p["chunk"]])
         # 剥掉出处标注：`（源文档 免责声明 1）` 是在引用源文档的小节名，不是本页写了免责
         blob = re.sub(r"[（(][^）)]{0,40}(?:源文档|§|第\s*\d)[^）)]{0,40}[）)]", " ", blob)
