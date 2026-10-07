@@ -2385,7 +2385,7 @@ def capacity_issues(page):
         max_rows = int(room // GEOM["box"]["td"])
         if len(rows) > max_rows:
             why = "（含图注）" if caps else ""
-            out.append(("ERROR" if len(rows) > max_rows + 1 else "WARN",
+            out.append(("ERROR",     # 超出几何上限 = 一定溢出，不是"可能"
                         f"表格 {len(rows)} 行超出画布{why}：几何上限 {max_rows} 行"
                         f"（可用 {avail:.0f}px − 表头 76 − 图注 {50 if caps else 0}）→ 砍 "
                         f"{len(rows) - max_rows} 行，或去掉图注，或按规范 §三 第 62 行换版式/拆页"))
