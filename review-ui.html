@@ -148,6 +148,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
+const T = new URLSearchParams(location.search).get('t') || '';   // 绑非本机时服务端要求带 token
 // 注意：value/checked/selected 要走属性赋值；false/null 一律不设属性（否则 setAttribute 会写成字符串 "false"/"null"）
 function el(t, a, kids) {
   const n = document.createElement(t);
@@ -169,7 +170,8 @@ function toast(msg, kind) {
   clearTimeout(t._h); t._h = setTimeout(() => { t.className = 'toast ' + (kind || ''); }, 3400);
 }
 async function api(path, body) {
-  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  const url = T ? (path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(T)) : path;
+  const r = await fetch(url, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -261,7 +263,7 @@ function renderDeck() {
   const s = ST.slides || []; $('#d-total').textContent = s.length;
   if (!s.length) { $('#slide').removeAttribute('src'); $('#d-label').textContent = '还没有截图（先跑 review）'; return; }
   cur.d = Math.max(0, Math.min(cur.d, s.length - 1));
-  $('#slide').src = s[cur.d].url + '&t=' + Date.now();
+  $('#slide').src = s[cur.d].url + (T ? '&t=' + encodeURIComponent(T) : '') + '&_=' + Date.now();
   $('#d-label').textContent = `第 ${cur.d + 1} 页`; $('#d-title').textContent = s[cur.d].title || '';
 }
 $('#prev').onclick = () => { cur.d--; renderDeck(); };
@@ -317,7 +319,7 @@ function renderVideo() {
   const v = ST.video;
   if (!v) { $('#v-none').style.display = ''; $('#v-wrap').style.display = 'none'; return; }
   $('#v-none').style.display = 'none'; $('#v-wrap').style.display = '';
-  $('#v').src = v.url;
+  $('#v').src = v.url + (T ? '&t=' + encodeURIComponent(T) : '');
   const rows = (v.pages || []).map(p => `<tr><td>${p.n}</td><td>${p.title || ''}</td><td>${p.target || '—'}</td>
     <td>${p.actual || '—'}</td><td class="${p.short ? 'warn' : 'dim'}">${p.dev || '—'}</td>
     <td><input type="checkbox" data-rn="${p.n}" ${(ST.redo || {})[p.n] ? 'checked' : ''}></td>

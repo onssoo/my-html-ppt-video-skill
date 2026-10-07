@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 spark
+Copyright (c) 2026 spark（上游 html-ppt-video-skill 原作者）
+Copyright (c) 2026 onssoo（本地化改造：PPTX/PDF 导入、多版本时长、审核台、克隆音色）
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

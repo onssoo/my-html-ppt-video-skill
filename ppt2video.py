@@ -1322,8 +1322,95 @@ def mux(out, cfg, total, fontdir=None, name="final-video.mp4"):
     print(f"\n完成：{Path(out, name)}（{total / 60:.1f} 分钟）")
 
 
-def cmd_build(out, slides, v=None):
+# ─── 审核状态（gates.json）：文件一改就自动变成"需重审" ─────────────
+# 记录"哪一次审核通过时，这些文件是什么哈希"。build 前比对：变过就拒绝，
+# 除非显式 --force。这样 SKILL.md 里"deck 一改必须重跑 review"的提醒由代码保证。
+
+def file_sha(p):
+    p = Path(p)
+    return hashlib.sha1(p.read_bytes()).hexdigest()[:12] if p.exists() else None
+
+
+def gates_path(out):
+    return Path(out) / "gates.json"
+
+
+def gates_load(out):
+    try:
+        return json.loads(gates_path(out).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def gates_approve(out, gate, files):
+    """把某道门的通过状态与文件哈希写进 gates.json。"""
+    d = gates_load(out)
+    d.setdefault("gates", {})[gate] = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "files": {k: {"path": str(v), "sha": file_sha(v)} for k, v in files.items() if v},
+    }
+    gates_path(out).write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def gates_stale(out, gate, files):
+    """哪些文件在该门通过之后被改过（或从没通过过该门）。"""
+    rec = gates_load(out).get("gates", {}).get(gate)
+    if not rec:
+        return None                                  # 从没审过
+    bad = []
+    for name, path in files.items():
+        old = (rec.get("files", {}).get(name) or {}).get("sha")
+        if old and file_sha(path) != old:
+            bad.append(name)
+    return bad
+
+
+def find_outline_md(near):
+    """在 deck 附近按约定找 大纲.md（deck 同目录、上一级、上两级）。"""
+    if not near:
+        return None
+    for d in (Path(near), Path(near).parent, Path(near).parent.parent):
+        c = d / OUTLINE_MD
+        if c.exists():
+            return c
+    return None
+
+
+def cmd_gates(out, deck=None):
+    """打印审核状态：哪道门什么时候通过、之后哪些文件被改过。"""
+    d = gates_load(out)
+    gates = d.get("gates", {})
+    if not gates:
+        print("还没有审核记录（gates.json 为空）")
+        return 0
+    bad_total = 0
+    for name, rec in gates.items():
+        stale = gates_stale(out, name, {k: v["path"] for k, v in rec.get("files", {}).items()})
+        bad_total += len(stale or [])
+        flag = "✔ 有效" if not stale else f"⚠ 需重审：{'、'.join(stale)}"
+        print(f"  [{name}] {rec.get('at', '?')}  {flag}")
+        for k, v in rec.get("files", {}).items():
+            print(f"      {k}: {v['path']}")
+    return 1 if bad_total else 0
+
+
+def cmd_build(out, slides, v=None, deck=None, force=False):
     tdir = v["dir"] if v else Path(out)          # 解说词/中间件/成片随版本走；画面和缓存共用
+
+    # —— 审核状态门禁：deck / 解说词 / 大纲 在通过审核之后又被改过 → 拒绝出片 ——
+    _files = {"narrations": tdir / "narrations.json"}
+    if deck:
+        _files["deck"] = deck
+        _omd = find_outline_md(deck)
+        if _omd:
+            _files["大纲"] = _omd
+    _stale = gates_stale(out, "review", _files)
+    if _stale and not force:
+        print("✘ 这些文件在通过审核之后被改过，需要重审（或在确知没影响时用 --force）："
+              + "、".join(_stale))
+        return 2
+    if _stale is None:
+        print("· 还没有审核记录（gates.json 为空）：建议先跑 review-ui 过一道 Gate 2")
     rv = tdir / "review.md"
     if not rv.exists():
         sys.exit("先运行 review")
@@ -1983,6 +2070,10 @@ def outline_preflight(parsed, src_text=None):
 
 def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, open_browser=True):
     import http.server, mimetypes, socket, threading, urllib.parse, webbrowser
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # 立刻看到 URL，否则重定向到文件时会被缓冲
+    except Exception:
+        pass
 
     tgt = Path(target).resolve()
     if not tgt.exists():
@@ -1998,6 +2089,11 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
     tpl = Path(__file__).resolve().parent / "review-ui.html"
     if not tpl.exists():
         sys.exit(f"缺界面文件 {tpl}")
+    import secrets
+    # 绑非本机（tailnet/局域网）时必须有 token，否则同网段任何人都能 /save 写文件
+    TOKEN = secrets.token_urlsafe(16) if host not in ("127.0.0.1", "localhost", "::1") else ""
+    if TOKEN:
+        print(f"⚠ 绑定在 {host}：已启用访问 token（不带 token 的请求一律 403）")
 
     def slides_of():
         if not deck:
@@ -2113,8 +2209,16 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        def _authed(self, u):
+            if not TOKEN:
+                return True
+            return urllib.parse.parse_qs(u.query).get("t", [""])[0] == TOKEN or \
+                   self.headers.get("X-Review-Token") == TOKEN
+
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
+            if not self._authed(u):
+                return self._send(403, b'{"error":"need token"}')
             if u.path == "/":
                 return self._send(200, tpl.read_bytes(), "text/html; charset=utf-8")   # 每次读，改界面不用重启
             if u.path == "/state":
@@ -2148,7 +2252,10 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                 return
             self._send(404, b'{"error":"not found"}')
         def do_POST(self):
-            path = urllib.parse.urlparse(self.path).path
+            _u = urllib.parse.urlparse(self.path)
+            if not self._authed(_u):
+                return self._send(403, b'{"error":"need token"}')
+            path = _u.path
             n = int(self.headers.get("Content-Length") or 0)
             try:
                 req = json.loads(self.rfile.read(n) or b"{}")
@@ -2218,6 +2325,15 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
                 changes.append(f"重录标记：{len(req.get('redo') or {})} 页")
                 return self._send(200, b'{"ok":true}')
             if g == "done":
+                try:                                   # 记下"这次通过时这些文件是什么哈希"
+                    gates_approve(out, "review", {
+                        "deck": deck or str(tgt),
+                        "narrations": tdir / "narrations.json",
+                        **({"大纲": omd} if omd else {}),
+                    })
+                    changes.append("已记录审核状态（gates.json）")
+                except Exception as e:
+                    print(f"⚠ 写 gates.json 失败：{type(e).__name__}: {e}")
                 log = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "target": str(tgt),
                        "version": version, "changes": changes}
                 (work / "review-log.json").write_text(json.dumps(log, ensure_ascii=False, indent=2),
@@ -2246,7 +2362,8 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
             ips.append(info[4][0])
     except Exception:
         pass
-    urls = [f"http://{i}:{port}/" for i in dict.fromkeys(ips)]
+    qs = f"?t={TOKEN}" if TOKEN else ""
+    urls = [f"http://{i}:{port}/{qs}" for i in dict.fromkeys(ips)]
     print("审核台已启动：")
     for u in urls:
         print("   " + u)
@@ -2272,7 +2389,7 @@ def cmd_review_ui(target, version=None, host="127.0.0.1", port=8099, gate=None, 
 
 def main():
     ap = argparse.ArgumentParser(description="幻灯片（HTML / PPTX / PDF）→ 配音讲解视频")
-    ap.add_argument("cmd", choices=["check", "outline", "deck-skeleton", "import", "narrate", "review",
+    ap.add_argument("cmd", choices=["check", "outline", "deck-skeleton", "gates", "import", "narrate", "review",
                                     "deck-pdf", "review-doc", "qc", "review-ui", "build"])
     ap.add_argument("deck", nargs="?", help="幻灯片 HTML / PPTX / PDF，或 outline.json")
     ap.add_argument("--out", help="审核产物的输出路径（大纲审定稿 / 预览 PDF / 审定稿 / 质检报告）")
@@ -2292,6 +2409,8 @@ def main():
                     help="【单版本模式】无 data-sec 的页用此字数下限（有 data-sec 时按 时长×CPS 推算）；"
                          "用 --version 时不生效，字数由版本总时长分配")
     ap.add_argument("--version", help="versions.json 里的版本名（如 investor-10）；不传则走单版本流程")
+    ap.add_argument("--force", action="store_true",
+                    help="忽略审核状态门禁（文件在审核后被改过时仍出片）")
     ap.add_argument("--disclaimer", action="store_true",
                     help="启用免责语。默认关闭：deck 与解说词都不自动出现免责/声明/风险提示内容")
     ap.add_argument("--hash-start", type=int, default=1,
@@ -2306,6 +2425,8 @@ def main():
         if not a.deck:
             ap.error("outline 需要 outline.json 路径")
         return cmd_outline(a.deck, a.out)
+    if a.cmd == "gates":
+        return cmd_gates(out if a.deck else Path("."), a.deck)
     if a.cmd == "deck-skeleton":               # 大纲 → deck 骨架（规范 §六）
         if not a.deck:
             ap.error("deck-skeleton 需要 大纲.md 路径")
@@ -2338,7 +2459,7 @@ def main():
     if not slides:
         sys.exit('没找到幻灯片：HTML 需要 <section class="slide">；PPTX/PDF 请确认是幻灯片版式')
     if a.cmd == "build":
-        return cmd_build(out, slides, v)
+        return cmd_build(out, slides, v, deck=deck, force=a.force)
     if a.cmd == "narrate":
         lo, hi = map(int, a.length.split("-"))
         pgs = parse_pages(a.pages, len(slides)) if a.pages else None

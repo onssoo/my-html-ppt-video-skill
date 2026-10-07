@@ -161,3 +161,17 @@ def test_page_seconds_scales_declared_seconds():
     assert abs(s[2] / s[3] - 40 / 60) < 0.01                      # 非 fixed 页保持 40:60 比例
     s2 = m.page_seconds(slides, 120, skip=(3,))
     assert 3 not in s2 and abs(sum(s2.values()) - 120) < 0.01     # 跳页后仍命中总长
+
+
+# ── 审核状态门禁（gates.json）──────────────────────────────
+def test_gates_approve_then_stale(tmp_path):
+    out = tmp_path / "vo"; out.mkdir()
+    deck = tmp_path / "deck.html"; deck.write_text("<html>v1</html>", encoding="utf-8")
+    m.gates_approve(out, "review", {"deck": deck})
+    assert m.gates_stale(out, "review", {"deck": deck}) == []        # 没改 → 不算过期
+    deck.write_text("<html>v2</html>", encoding="utf-8")
+    assert m.gates_stale(out, "review", {"deck": deck}) == ["deck"]  # 改了 → 过期
+    assert m.gates_stale(out, "review", {"deck": deck}) and \
+        m.cmd_build(str(out), [{"title": "a", "sec": 10, "text": [], "notes": []}],
+                    deck=str(deck)) == 2                             # build 拒绝
+    assert m.gates_stale(tmp_path / "nowhere", "review", {}) is None  # 从没审过

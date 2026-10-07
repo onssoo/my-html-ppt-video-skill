@@ -6,8 +6,8 @@
 本目录：
   SKILL.md            改写版 —— 依赖表/流程/配置/坑 全部按 M2 实测结果重写
   ppt2video.py        替代上游 build_video.py（保留审稿流程，见 SKILL.md 文末「与上游的差异」）
-  narration-spec.md   解说词规范 —— 正式陈述的语气/语言/结构/事实/免责/书写规则 + lint 清单
-  NOTES.md            本文件
+  references/narration-spec.md   解说词规范 —— 正式陈述的语气/语言/结构/事实/免责/书写规则 + lint 清单
+  CHANGELOG.md            本文件
 
 上游 build_video.py 未采用的原因：
   1. edge-tts 是在线微软 TTS，无法克隆本人音色
@@ -18,7 +18,7 @@
 
 本地版实测记录见 SKILL.md「Critical Pitfalls」（每条都有具体数字）。
 
-解说词规范（narration-spec.md）要点：
+解说词规范（references/narration-spec.md）要点：
   - 正式口头陈述，不是聊天：严谨/正向/自信/适度激情
   - 只用陈述句（无问句/自问自答）、无套话、无俚语、不提及画面
   - 区分事实与预测，数字口径一致（brief.md 口径表），竞争对手中性描述
@@ -201,8 +201,8 @@ owner 原话：**"免责这部分除非我要求添加，否则 ppt 和视频都
 |---|---|
 | `ppt2video.py` | 新增 `DISCLAIMER_ON = False` 与 `NO_DISC_RULE`；新增 `--disclaimer` 开关；`lint()` 反着卡——默认任何页出现免责/声明类内容即不合格，仅 `--disclaimer` 打开时才要求 `disc` 页必须有 |
 | `SKILL.md` | `data-disclaimer` 从"必须带免责语"改成"免责默认关闭"；时长表里去掉了"免责页"；解说词规范摘要同步 |
-| `narration-spec.md` | 第八节由「风险与免责」改成「免责（默认不加）」；结尾页不再要求免责说明；lint 清单同步 |
-| `outline-schema.md` | 大纲格式里删掉 `- **免责**：是/否` 字段（大纲是 PPT 计划，不装视频/合规概念）|
+| `references/narration-spec.md` | 第八节由「风险与免责」改成「免责（默认不加）」；结尾页不再要求免责说明；lint 清单同步 |
+| `references/outline-schema.md` | 大纲格式里删掉 `- **免责**：是/否` 字段（大纲是 PPT 计划，不装视频/合规概念）|
 
 实测（六条全部符合预期）：
 
